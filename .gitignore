@@ -7,3 +7,8 @@ __pycache__/
 *.h5
 *.mp4
 *_videos/
+
+# References
+papers/
+*.pdf
+ref_video/
