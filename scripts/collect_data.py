@@ -6,7 +6,7 @@ setup — box tracking (AprilTag) is not implemented yet, so the box fields of
 `state` are NaN (safe end-to-end per the spec).
 
 Usage (run in a real terminal):
-    uv run collect_data.py [output.h5]
+    uv run scripts/collect_data.py [output.h5]
 
 Keys (terminal, or the preview window if a display is attached):
     SPACE  start recording an episode / stop and save it

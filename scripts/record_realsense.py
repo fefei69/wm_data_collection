@@ -1,7 +1,7 @@
 """Record color + depth video from a RealSense D435i.
 
 Usage:
-    uv run record_realsense.py [output.mp4] [duration_seconds]
+    uv run scripts/record_realsense.py [output.mp4] [duration_seconds]
 
 Saves a side-by-side (color | depth colormap) mp4. Shows a live preview
 window if a display is available. Press 'q' in the window or Ctrl+C to stop.
