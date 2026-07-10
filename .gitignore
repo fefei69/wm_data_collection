@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Collected data (keep datasets and recordings out of git)
+*.h5
+*.mp4
+*_videos/
