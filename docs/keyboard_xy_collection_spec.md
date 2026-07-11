@@ -199,7 +199,7 @@ setup before collection; plane-following control is out of scope for this MVP.
 | `r` | while idle, return to the fixed-pose collection start X/Y |
 | `SPACE` | start recording / stop and save |
 | `d` | stop and discard the current episode |
-| `q` | save an active episode, then quit normally |
+| `q` | quit normally while idle; ignore it during recording |
 | Close window | same graceful path as `q` |
 
 Use one focused Pygame window for both the exact model-view preview and input.
@@ -413,8 +413,8 @@ delta at command time.
 When `SPACE` requests episode stop, use the next tick as a final observation:
 record and issue a zero-delta command (the same Cartesian target), then close
 the episode. This keeps the outcome of the preceding action inside the episode.
-An active `q` uses this same graceful close and then proceeds to shutdown. It is
-the only intended episode-lifecycle difference from `collect_data.py`.
+`q` is ignored during an active episode. The operator must use `SPACE` for this
+graceful close, then press `q` while idle to quit.
 
 The final observation remains on the regular 5 Hz schedule; it represents the
 actual 0.2 s outcome even if the arm has not fully converged. After closing the
@@ -490,13 +490,9 @@ offline before live execution.
 - Verify each arrow's physical direction one key at a time.
 - Verify the pusher-tip height separately before enabling contact.
 - Use position mode only. Do not add external-effort/gravity mode to this MVP.
-- On normal `q` or a window-close event, gracefully close any active episode,
-  stop motion, and close video/HDF5/ROS resources. Keep the Pygame window open
-  with a clear-table prompt and wait for an edge-triggered `Enter`. Only after
-  that explicit confirmation run a commissioned safe retreat: first raise in
-  base +Z with fixed orientation, then use the existing joint-home and sleep
-  sequence. Close Pygame afterward. Never sweep directly from a low contact
-  pose through an uncleared table.
+- On `q` while idle, stop motion, close video/HDF5/ROS resources, and leave the
+  arm holding its current pose. Ignore `q` during an active episode so saving
+  always requires an explicit `SPACE` press.
 - On a driver error or unexpected exception, stop issuing commands, close
   recording and Pygame resources, and leave the arm holding its last position;
   do not launch an automatic recovery trajectory.

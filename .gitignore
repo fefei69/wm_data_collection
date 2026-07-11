@@ -7,6 +7,7 @@ __pycache__/
 *.h5
 *.mp4
 *_videos/
+arms_utils/
 
 # References
 papers/

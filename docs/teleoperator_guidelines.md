@@ -51,7 +51,7 @@ uv run scripts/check_camera_health.py   # must print "verdict: HEALTHY"
 | `SPACE` | Start recording, or gracefully finish and save an episode |
 | `d` | Stop and discard the active episode |
 | `r` | While idle, return toward the configured XY start |
-| `q` | Gracefully finish, close resources, and begin supervised shutdown |
+| `q` | Quit while idle; ignored during recording (use `SPACE` to save first) |
 
 No held arrow means a recorded zero-delta hold. Opposing arrows cancel their
 axis. Never use `r` while recording. Keep the Pygame preview window focused;

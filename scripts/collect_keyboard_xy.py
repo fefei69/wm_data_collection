@@ -43,7 +43,7 @@ DEFAULT_MAGNITUDES = {1: 0.0025, 2: 0.005, 3: 0.010}
 def accepted_target(
     current_xy: np.ndarray,
     requested_delta: np.ndarray,
-    bounds: tuple[tuple[float, float], tuple[float, float]],
+    bounds: tuple[tuple[float, float], tuple[float, float]] | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Clip a requested XY target and return ``(target, actual_delta)``."""
     current = np.asarray(current_xy, dtype=np.float64)
@@ -52,6 +52,9 @@ def accepted_target(
         raise ValueError("current_xy and requested_delta must have shape (2,)")
     if not np.all(np.isfinite(current)) or not np.all(np.isfinite(delta)):
         raise ValueError("current_xy and requested_delta must be finite")
+    if bounds is None:
+        target = current + delta
+        return target, delta.copy()
     lower = np.array([bounds[0][0], bounds[1][0]], dtype=np.float64)
     upper = np.array([bounds[0][1], bounds[1][1]], dtype=np.float64)
     if np.any(lower >= upper):
@@ -71,9 +74,10 @@ class CollectorConfig:
     fixed_z: float = 0.20
     safe_z: float = 0.30
     start_xy: tuple[float, float] = (0.30, 0.0)
-    x_bounds: tuple[float, float] = (0.15, 0.45)
-    y_bounds: tuple[float, float] = (-0.25, 0.25)
+    x_bounds: tuple[float, float] = (0.18, 0.29)
+    y_bounds: tuple[float, float] = (-0.12, 0.12)
     trajectory_check_samples: int = 10
+    enforce_xy_limits: bool = True
     magnitudes: Mapping[int, float] = field(default_factory=lambda: dict(DEFAULT_MAGNITUDES))
 
     @classmethod
@@ -116,10 +120,11 @@ class CollectorConfig:
             raise ValueError("safe_z must be above fixed_z")
         if self.x_bounds[0] >= self.x_bounds[1] or self.y_bounds[0] >= self.y_bounds[1]:
             raise ValueError("workspace bounds must be strictly increasing")
-        if not (self.x_bounds[0] <= self.start_xy[0] <= self.x_bounds[1]):
-            raise ValueError("start x is outside workspace bounds")
-        if not (self.y_bounds[0] <= self.start_xy[1] <= self.y_bounds[1]):
-            raise ValueError("start y is outside workspace bounds")
+        if self.enforce_xy_limits:
+            if not (self.x_bounds[0] <= self.start_xy[0] <= self.x_bounds[1]):
+                raise ValueError("start x is outside workspace bounds")
+            if not (self.y_bounds[0] <= self.start_xy[1] <= self.y_bounds[1]):
+                raise ValueError("start y is outside workspace bounds")
         if self.trajectory_check_samples < 1:
             raise ValueError("trajectory_check_samples must be positive")
         validate_magnitudes(self.magnitudes, ACTION_CAP_M)
@@ -242,11 +247,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--safe-z", required=True, type=float)
     parser.add_argument("--start-x", required=True, type=float)
     parser.add_argument("--start-y", required=True, type=float)
-    parser.add_argument("--x-min", required=True, type=float)
-    parser.add_argument("--x-max", required=True, type=float)
-    parser.add_argument("--y-min", required=True, type=float)
-    parser.add_argument("--y-max", required=True, type=float)
+    parser.add_argument("--x-min", type=float, default=0.18)
+    parser.add_argument("--x-max", type=float, default=0.29)
+    parser.add_argument("--y-min", type=float, default=-0.12)
+    parser.add_argument("--y-max", type=float, default=0.12)
     parser.add_argument("--trajectory-check-samples", required=True, type=int)
+    parser.add_argument(
+        "--disable-xy-limits",
+        action="store_true",
+        help="do not clamp keyboard or reset motion to the configured X/Y bounds",
+    )
     parser.add_argument(
         "--skip-camera-check",
         action="store_true",
@@ -274,6 +284,7 @@ def _config_from_args(args: argparse.Namespace) -> CollectorConfig:
         x_bounds=(args.x_min, args.x_max),
         y_bounds=(args.y_min, args.y_max),
         trajectory_check_samples=args.trajectory_check_samples,
+        enforce_xy_limits=not args.disable_xy_limits,
     )
 
 
@@ -305,16 +316,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     home_positions = np.array([0.0, np.pi / 2, np.pi / 2, 0.0, 0.0, 0.0, 0.0])
     recording = False
     quit_requested = False
-    quit_after_stop = False
     pending_stop = False
     resetting = False
-    normal_exit = False
+    recording_started_at: float | None = None
+    next_recording_report_s = 5
     target_xy = np.array(config.start_xy, dtype=np.float64)
     previous_sequence: int | None = None
     episode_id = 0
     recorder = EpisodeRecorder(output_h5=config.output_h5)
     preview = np.zeros((224, 224, 3), dtype=np.uint8)
     last_ros_error: BaseException | None = None
+    blocked_action: tuple[float, float] | None = None
+    xy_bounds = (config.x_bounds, config.y_bounds) if config.enforce_xy_limits else None
+
+    if not config.enforce_xy_limits:
+        print(
+            "WARNING: X/Y workspace limits are DISABLED; keyboard commands will not be clamped. "
+            "Keep the physical E-stop within reach."
+        )
 
     try:
         arm.home(home_positions)
@@ -327,17 +346,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         while not quit_requested:
             events = pygame_input.poll()
             if events.quit_requested:
-                resetting = False  # q cancels an in-flight reset, then proceeds to quit
                 if recording:
-                    pending_stop = True
-                    quit_after_stop = True
+                    print("q ignored while recording: press SPACE to stop and save the episode first")
                 else:
+                    resetting = False
                     quit_requested = True
             if events.discard_requested:
+                if recording and recording_started_at is not None:
+                    elapsed = time.monotonic() - recording_started_at
+                    print(f"episode discarded after {elapsed:.1f} seconds")
                 recorder.start()
                 recording = False
+                recording_started_at = None
                 pending_stop = False
-                quit_after_stop = False
                 resetting = False
             if events.save_toggle:
                 if recording:
@@ -354,16 +375,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     episode_id += 1
                     recording = True
+                    recording_started_at = time.monotonic()
+                    next_recording_report_s = 5
+                    print("recording started; recommended episode length is 24-30 seconds")
                     recorder.start()
             if events.reset_requested and not recording:
                 # The actual step-by-step motion happens on the 5 Hz tick below.
                 resetting = True
             if events.focus_lost:
                 if recording:
+                    if recording_started_at is not None:
+                        elapsed = time.monotonic() - recording_started_at
+                        print(f"episode discarded after {elapsed:.1f} seconds: preview lost focus")
                     recorder.start()
                     recording = False
+                    recording_started_at = None
                 pending_stop = False
-                quit_after_stop = False
                 resetting = False
                 # Clear held motion and immediately command a fixed-target hold.
                 arm.send_cartesian(np.r_[target_xy, config.fixed_z, FIXED_ORIENTATION])
@@ -374,18 +401,47 @@ def main(argv: Sequence[str] | None = None) -> int:
                 held_action = pygame_input.action()
                 if pending_stop and recording:
                     held_action = np.zeros(2, dtype=np.float32)
-                target, actual = accepted_target(target_xy, held_action, (config.x_bounds, config.y_bounds))
+                target, actual = accepted_target(target_xy, held_action, xy_bounds)
+                requested_motion = float(np.linalg.norm(held_action)) > 0.0
+                motion_blocked = requested_motion and float(np.linalg.norm(actual)) == 0.0
+                action_key = tuple(float(value) for value in held_action)
+                if motion_blocked and action_key != blocked_action:
+                    print(
+                        "keyboard motion blocked by workspace limit: "
+                        f"position=({target_xy[0]:.3f}, {target_xy[1]:.3f}), "
+                        f"bounds=x[{config.x_bounds[0]:.3f}, {config.x_bounds[1]:.3f}] "
+                        f"y[{config.y_bounds[0]:.3f}, {config.y_bounds[1]:.3f}]"
+                    )
+                    blocked_action = action_key
+                elif not motion_blocked:
+                    blocked_action = None
                 if ros.error is not None and ros.error is not last_ros_error:
                     last_ros_error = ros.error
                     print(f"camera subscriber error: {last_ros_error}")
                 if recording:
+                    if recording_started_at is not None:
+                        elapsed = time.monotonic() - recording_started_at
+                        if elapsed >= next_recording_report_s:
+                            if next_recording_report_s < 25:
+                                print(f"recording: {next_recording_report_s} seconds elapsed")
+                            elif next_recording_report_s == 25:
+                                print("recording: 25 seconds elapsed — recommended stop window is now open")
+                            else:
+                                print(
+                                    f"recording: {next_recording_report_s} seconds elapsed — "
+                                    "press SPACE to stop and save"
+                                )
+                            next_recording_report_s += 5
                     snapshot = image_store.snapshot()
                     fresh = snapshot is not None and LatestImageStore.accept(snapshot, previous_sequence, time.monotonic_ns(), IMAGE_MAX_AGE_S)
                     if not fresh:
+                        if recording_started_at is not None:
+                            elapsed = time.monotonic() - recording_started_at
+                            print(f"episode discarded after {elapsed:.1f} seconds: camera frame was stale")
                         recorder.start()
                         recording = False
+                        recording_started_at = None
                         pending_stop = False
-                        quit_after_stop = False
                     else:
                         previous_sequence = snapshot.sequence
                         pixels = config.transform_profile.apply(snapshot.rgb)
@@ -407,11 +463,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         target_xy = target
                         if pending_stop:
                             recorder.finish(save=True)
+                            if recording_started_at is not None:
+                                elapsed = time.monotonic() - recording_started_at
+                                print(f"episode saved: {elapsed:.1f} seconds")
                             recording = False
+                            recording_started_at = None
                             pending_stop = False
-                            if quit_after_stop:
-                                quit_requested = True
-                                quit_after_stop = False
                 else:
                     # Idle: keep the live preview current so the operator can
                     # frame the box/pusher before recording (workflow step 1).
@@ -432,7 +489,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             if remaining_norm > RESET_STEP_M:
                                 remaining = remaining * (RESET_STEP_M / remaining_norm)
                             reset_target, _ = accepted_target(
-                                target_xy, remaining, (config.x_bounds, config.y_bounds)
+                                target_xy, remaining, xy_bounds
                             )
                             arm.send_cartesian(np.r_[reset_target, config.fixed_z, FIXED_ORIENTATION])
                             target_xy = reset_target
@@ -441,25 +498,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if not recording and quit_requested:
                     break
             pygame_input.render(preview, "recording" if recording else "idle")
-        normal_exit = True
     finally:
         if recording:
             # Best-effort discard: clearing the buffer must never mask a
             # real error propagating out of the try block above.
             recorder.start()
-        try:
-            if normal_exit:
-                # Only a clean shutdown (q/window-close, confirmed by the
-                # operator) retreats the arm; an exception leaves it holding
-                # its last position per spec (no automatic recovery).
-                pygame_input.confirm_shutdown()
-                arm.send_cartesian(
-                    np.r_[target_xy, config.safe_z, FIXED_ORIENTATION], goal_time=2.0, blocking=True
-                )
-                arm.home(home_positions)
-        finally:
-            pygame_input.close()
-            ros.stop()
+        # Leave the arm holding its current pose. A normal q/window-close does
+        # not retreat, home, or sleep, so the operator controls any later move.
+        pygame_input.close()
+        ros.stop()
     return 0
 
 
