@@ -35,6 +35,7 @@ TICK_S = 0.2
 # image_receipt/command timestamps let QA audit the true lag per row.
 IMAGE_MAX_AGE_S = 0.20
 RESET_STEP_M = 0.005
+RESET_TOLERANCE_M = 0.002  # placeholder pending commissioning; see HOLD_POSITION_TOLERANCE_M in the spec
 FIXED_ORIENTATION = np.array([0.0, math.pi / 2.0, 0.0], dtype=np.float64)
 DEFAULT_MAGNITUDES = {1: 0.0025, 2: 0.005, 3: 0.010}
 
@@ -304,13 +305,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     home_positions = np.array([0.0, np.pi / 2, np.pi / 2, 0.0, 0.0, 0.0, 0.0])
     recording = False
     quit_requested = False
+    quit_after_stop = False
     pending_stop = False
+    resetting = False
     normal_exit = False
     target_xy = np.array(config.start_xy, dtype=np.float64)
     previous_sequence: int | None = None
     episode_id = 0
     recorder = EpisodeRecorder(output_h5=config.output_h5)
     preview = np.zeros((224, 224, 3), dtype=np.uint8)
+    last_ros_error: BaseException | None = None
 
     try:
         arm.home(home_positions)
@@ -323,15 +327,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         while not quit_requested:
             events = pygame_input.poll()
             if events.quit_requested:
-                pending_stop = recording
-                quit_requested = not recording
+                resetting = False  # q cancels an in-flight reset, then proceeds to quit
+                if recording:
+                    pending_stop = True
+                    quit_after_stop = True
+                else:
+                    quit_requested = True
             if events.discard_requested:
                 recorder.start()
                 recording = False
                 pending_stop = False
+                quit_after_stop = False
+                resetting = False
             if events.save_toggle:
                 if recording:
                     pending_stop = True
+                elif resetting:
+                    # First SPACE during a reset cancels it and waits for the
+                    # in-flight step to settle; a later press starts recording.
+                    resetting = False
                 else:
                     recorder = EpisodeRecorder(
                         output_h5=config.output_h5,
@@ -342,22 +356,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     recording = True
                     recorder.start()
             if events.reset_requested and not recording:
-                reset_delta = np.array(config.start_xy, dtype=np.float64) - target_xy
-                reset_norm = float(np.linalg.norm(reset_delta))
-                if reset_norm > RESET_STEP_M:
-                    reset_delta *= RESET_STEP_M / reset_norm
-                target_xy, _ = accepted_target(target_xy, reset_delta, (config.x_bounds, config.y_bounds))
-                arm.send_cartesian(np.r_[target_xy, config.fixed_z, FIXED_ORIENTATION], goal_time=1.0, blocking=False)
+                # The actual step-by-step motion happens on the 5 Hz tick below.
+                resetting = True
             if events.focus_lost:
                 if recording:
                     recorder.start()
                     recording = False
                 pending_stop = False
+                quit_after_stop = False
+                resetting = False
                 # Clear held motion and immediately command a fixed-target hold.
                 arm.send_cartesian(np.r_[target_xy, config.fixed_z, FIXED_ORIENTATION])
-            if pending_stop and recording:
-                # Final zero row is collected at the next valid tick.
-                pass
 
             now = time.monotonic()
             if now >= next_tick:
@@ -366,6 +375,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if pending_stop and recording:
                     held_action = np.zeros(2, dtype=np.float32)
                 target, actual = accepted_target(target_xy, held_action, (config.x_bounds, config.y_bounds))
+                if ros.error is not None and ros.error is not last_ros_error:
+                    last_ros_error = ros.error
+                    print(f"camera subscriber error: {last_ros_error}")
                 if recording:
                     snapshot = image_store.snapshot()
                     fresh = snapshot is not None and LatestImageStore.accept(snapshot, previous_sequence, time.monotonic_ns(), IMAGE_MAX_AGE_S)
@@ -373,6 +385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         recorder.start()
                         recording = False
                         pending_stop = False
+                        quit_after_stop = False
                     else:
                         previous_sequence = snapshot.sequence
                         pixels = config.transform_profile.apply(snapshot.rgb)
@@ -396,24 +409,54 @@ def main(argv: Sequence[str] | None = None) -> int:
                             recorder.finish(save=True)
                             recording = False
                             pending_stop = False
-                            if events.quit_requested:
+                            if quit_after_stop:
                                 quit_requested = True
-                elif np.linalg.norm(actual) > 0.0:
-                    # Idle arrow motion positions the EE but is not logged.
-                    arm.send_cartesian(np.r_[target, config.fixed_z, FIXED_ORIENTATION])
-                    target_xy = target
+                                quit_after_stop = False
+                else:
+                    # Idle: keep the live preview current so the operator can
+                    # frame the box/pusher before recording (workflow step 1).
+                    snapshot = image_store.snapshot()
+                    if snapshot is not None:
+                        preview = config.transform_profile.apply(snapshot.rgb)
+                    if np.linalg.norm(actual) > 0.0:
+                        resetting = False  # any arrow cancels an in-flight reset
+                        arm.send_cartesian(np.r_[target, config.fixed_z, FIXED_ORIENTATION])
+                        target_xy = target
+                    elif resetting:
+                        start = np.array(config.start_xy, dtype=np.float64)
+                        remaining = start - target_xy
+                        remaining_norm = float(np.linalg.norm(remaining))
+                        if remaining_norm <= RESET_TOLERANCE_M:
+                            resetting = False
+                        else:
+                            if remaining_norm > RESET_STEP_M:
+                                remaining = remaining * (RESET_STEP_M / remaining_norm)
+                            reset_target, _ = accepted_target(
+                                target_xy, remaining, (config.x_bounds, config.y_bounds)
+                            )
+                            arm.send_cartesian(np.r_[reset_target, config.fixed_z, FIXED_ORIENTATION])
+                            target_xy = reset_target
+                            if float(np.linalg.norm(start - target_xy)) <= RESET_TOLERANCE_M:
+                                resetting = False
                 if not recording and quit_requested:
                     break
             pygame_input.render(preview, "recording" if recording else "idle")
         normal_exit = True
     finally:
+        if recording:
+            # Best-effort discard: clearing the buffer must never mask a
+            # real error propagating out of the try block above.
+            recorder.start()
         try:
-            if recording:
-                recorder.finish(save=False)
             if normal_exit:
+                # Only a clean shutdown (q/window-close, confirmed by the
+                # operator) retreats the arm; an exception leaves it holding
+                # its last position per spec (no automatic recovery).
                 pygame_input.confirm_shutdown()
-            arm.send_cartesian(np.r_[target_xy, config.safe_z, FIXED_ORIENTATION], goal_time=2.0, blocking=True)
-            arm.home(home_positions)
+                arm.send_cartesian(
+                    np.r_[target_xy, config.safe_z, FIXED_ORIENTATION], goal_time=2.0, blocking=True
+                )
+                arm.home(home_positions)
         finally:
             pygame_input.close()
             ros.stop()
