@@ -16,7 +16,7 @@ WorldPlanner & FoG-MBRL papers (real-arm pushing world models trained from scrat
 | Item | Requirement |
 |---|---|
 | Camera | One fixed Intel RealSense, rigidly mounted overhead or high-oblique. The collector receives ROS 2 Jazzy `sensor_msgs/msg/Image` messages from `/camera/camera/color/image_raw`; it never opens the camera with `pyrealsense2`. The camera supplies pixels only; no online detector is required. |
-| ROS image profile | `rgb8`, 640×480, 30 fps. Subscribe best-effort/volatile with keep-last depth 1 and retain only the newest message. Preserve the full source frame in the raw archive. |
+| ROS image profile | `rgb8`, 640×480, 60 fps (raised from 30 so per-tick freshness survives occasional multi-frame delivery gaps; measured 2026-07-11). Subscribe best-effort/volatile with keep-last depth 1 and retain only the newest message. Preserve the full source frame in the raw archive. |
 | Camera settings | **Lock exposure, white balance, focus, gain.** No auto-anything — world models are brittle to photometric drift (stable-worldmodel paper Tab. 2). |
 | Lighting | Fixed, diffuse. No windows/daylight variation if possible. |
 | Work area | Flat, plain matte table with high contrast to the box. A physical border is optional; when the box approaches or leaves the camera/reachable area, stop recording and reset it manually. |
@@ -35,7 +35,10 @@ WorldPlanner & FoG-MBRL papers (real-arm pushing world models trained from scrat
   **then** issue `action[t]`. So `pixels[t+1]` shows the outcome of `action[t]`.
 - The image callback stores the ROS `header.stamp` and host monotonic receipt time with the
   image. At a dataset tick, consume the newest message only if it is new since the previous
-  tick and no more than 0.10 s old. Otherwise hold position and discard the active episode.
+  tick and no more than 0.20 s old. Otherwise hold position and discard the active episode.
+  (Bound relaxed from 0.10 s on 2026-07-11: at 60 fps the typical frame age is 17–35 ms,
+  the logged receipt/command timestamps allow per-row lag QA offline, and one tick is the
+  hard ceiling regardless.)
 - Ticks must be uniform to ±10% (see QA §8).
 
 ## 3. Action space — 2D Cartesian delta
@@ -146,7 +149,7 @@ with swm.data.HDF5Writer(
 
 Buffer each episode in RAM (150 steps × 150 KB ≈ 23 MB) and write on episode end.
 Expected file size: ~2.7 GB uncompressed (fine for the pilot; the writer doesn't compress).
-**Also record the raw ROS image topic with rosbag2 at 640×480/30 fps.** The
+**Also record the raw ROS image topic with rosbag2 at 640×480/60 fps.** The
 collector may write a separate 5 Hz per-episode model-view MP4 for quick review,
 but that preview is not the native-rate archive. The bag lets you regenerate the
 HDF5 after the image-transform commissioning comparison without re-collecting.
@@ -158,7 +161,8 @@ HDF5 after the image-transform commissioning comparison without re-collecting.
    off by one tick.
 2. **Timing:** `diff(command_monotonic_ns)` is 0.20 ± 0.02 s; source stamps are
    strictly increasing; and `command_monotonic_ns - image_receipt_monotonic_ns`
-   is between 0 and 0.10 s for every selected image.
+   is between 0 and 0.20 s for every selected image (flag episodes where the
+   median exceeds 0.05 s — that indicates a degraded stream, not one hiccup).
 3. **State contract:** all four unmeasured box-state values are `NaN`; EE X/Y remain finite.
 4. **Visual sanity:** random 20 frames — box+EE are usefully visible, exposure constant, no motion
    blur that hides the box edge.

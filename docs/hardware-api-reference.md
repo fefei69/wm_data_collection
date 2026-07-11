@@ -8,7 +8,8 @@ This file records only the hardware facts needed to implement and commission
 - Follower: Trossen WXAI V0 with follower end effector, `192.168.1.3`.
 - Leader: unused by the keyboard collector.
 - Camera source: ROS 2 Jazzy topic `/camera/camera/color/image_raw`,
-  `sensor_msgs/msg/Image`, `rgb8`, 640×480 at 30 fps.
+  `sensor_msgs/msg/Image`, `rgb8`, 640×480 at 60 fps (raised from 30 on
+  2026-07-11 so per-tick freshness survives multi-frame delivery gaps).
 - Dataset/control rate: 5 Hz (`0.2 s` per action).
 
 ## Existing verified calls
@@ -131,7 +132,7 @@ the camera. A separate RealSense ROS node publishes:
 | Type | `sensor_msgs/msg/Image` |
 | Encoding | `rgb8` |
 | Width / height | 640 / 480 |
-| Expected rate | 30 fps |
+| Expected rate | 60 fps |
 
 Source ROS before launching the collector:
 
@@ -139,27 +140,41 @@ Source ROS before launching the collector:
 source /opt/ros/jazzy/setup.bash
 ```
 
-Use `rclpy`, `sensor_msgs`, and `cv_bridge` from the Jazzy installation. The
+Use `rclpy` and `sensor_msgs` from the Jazzy installation. The
 subscription requests best-effort reliability, volatile durability, keep-last
 history, and depth 1. This is compatible with the normal sensor-data publisher
 profile and prevents queued old frames. The application also retains only one
 atomic latest-frame slot.
 
-Convert explicitly with:
-
-```python
-bridge.imgmsg_to_cv2(message, desired_encoding="rgb8")
-```
+Do **not** use `cv_bridge`: Jazzy's `cv_bridge` extension is compiled against
+NumPy 1.x and crashes under this project's NumPy >= 2 pin (verified on the
+robot host 2026-07-11). An `rgb8` payload needs no color conversion, so
+`scripts/ros_camera.py::decode_rgb8` decodes it with NumPy only — a bounded
+reshape honoring `message.step` — and `rclpy` additionally needs `pyyaml`,
+which is declared in `pyproject.toml`.
 
 Pair every image with its ROS `header.stamp`, host `time.monotonic_ns()` receipt
 time, and a local sequence counter. Record a separate monotonic timestamp
 immediately before each arm command. A 5 Hz recording tick may use an image only
-once and only while its receipt age is at most 0.10 s. Wrong encoding/shape, a
-reused frame, or a stale frame invalidates an active episode.
+once and only while its receipt age is at most 0.20 s (`IMAGE_MAX_AGE_S`).
+Wrong encoding/shape, a reused frame, or a stale frame invalidates an active
+episode.
+
+### Stream health gate (measured 2026-07-11)
+
+Delivery hiccups of 100–370 ms occur even on a healthy rig, and desktop load
+(a browser, etc.) multiplies them ~80×. For a 150-tick episode to survive the
+freshness rule with p >= 0.9, the newest frame may be older than the bound for
+at most ~0.05% of wall time. `scripts/check_camera_health.py` measures exactly
+this and must report HEALTHY before a session; the collector runs the same gate
+at startup (skip with `--skip-camera-check`). Collect on a quiet machine.
+Kernel tuning that helps and currently resets at reboot: `net.core.rmem_max`
+/ `rmem_default` / `wmem_max` / `wmem_default` = 64 MB, and
+`/sys/module/usbcore/parameters/usbfs_memory_mb` = 256.
 
 The required source profile is already appropriate. Changing the SDK profile
 is unnecessary unless a tested native square profile preserves at least the
-same useful field of view at 30 fps. The 4:3-to-square model transform remains
+same useful field of view at 60 fps. The 4:3-to-square model transform remains
 a commissioning choice between a fixed square workspace ROI and
 aspect-preserving letterboxing. Record and freeze the selected parameters
 before collecting; never stretch 4:3 directly to 224×224 or mix transforms.

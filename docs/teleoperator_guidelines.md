@@ -10,18 +10,23 @@ demonstrations.
 - Clear the table before startup and confirm the commissioned safe path to the
   fixed-height collection pose.
 - Source ROS 2 Jazzy and start the RealSense publisher.
+- Close browsers and other heavy applications; desktop load starves the image
+  subscriber and silently kills episodes (measured 2026-07-11).
 - Confirm `/camera/camera/color/image_raw` is a healthy
-  `sensor_msgs/msg/Image` stream: `rgb8`, 640×480, approximately 30 fps.
+  `sensor_msgs/msg/Image` stream: `rgb8`, 640×480, approximately 60 fps.
 
 ```bash
 ros2 topic info -v /camera/camera/color/image_raw
-ros2 topic hz /camera/camera/color/image_raw
+uv run scripts/check_camera_health.py   # must print "verdict: HEALTHY"
 ```
+
+  The collector repeats this gate at startup; `--skip-camera-check` bypasses
+  it if you accept the risk of frequent freshness-based episode discards.
 
 - Confirm supported exposure, white-balance, gain, and focus controls are fixed
   on the publisher; save `ros2 param dump <publisher_node>` with the session.
 - In a separate terminal, start a session-level rosbag2 recording of
-  `/camera/camera/color/image_raw` before the first episode. This is the 30 fps
+  `/camera/camera/color/image_raw` before the first episode. This is the 60 fps
   source archive; the collector's per-episode MP4 contains only selected 5 Hz
   model frames.
 - Confirm the session's commissioned square image-transform profile, then

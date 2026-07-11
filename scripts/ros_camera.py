@@ -1,13 +1,22 @@
-"""ROS 2 Jazzy image subscription and latest-frame buffering."""
+"""ROS 2 Jazzy image subscription, latest-frame buffering, and stream health."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
 import time
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
+
+
+# Stream-health gate defaults, derived from measured episode-survival math
+# (2026-07-11): a 150-tick episode survives with p >= 0.9 only when the newest
+# frame is older than the freshness bound for <= ~0.05% of the time.
+HEALTH_MAX_AGE_S = 0.20
+HEALTH_MAX_STALE_FRACTION = 0.0005
+HEALTH_MAX_GAP_S = 0.300
+HEALTH_MIN_FPS = 20.0
 
 
 @dataclass(frozen=True)
@@ -16,6 +25,24 @@ class ImageSnapshot:
     source_timestamp_ns: int
     receipt_monotonic_ns: int
     sequence: int
+
+
+def decode_rgb8(message: Any) -> np.ndarray:
+    """Decode a sensor_msgs/msg/Image rgb8 payload with NumPy only.
+
+    Jazzy's cv_bridge extension is compiled against NumPy 1.x and crashes
+    under this project's NumPy >= 2 pin; an rgb8 payload needs no color
+    conversion, only a bounded reshape that honors the row stride.
+    """
+    if message.encoding != "rgb8":
+        raise ValueError(f"expected rgb8, received {message.encoding!r}")
+    height, width, step = int(message.height), int(message.width), int(message.step)
+    if step < width * 3:
+        raise ValueError(f"row step {step} is too small for width {width}")
+    data = np.frombuffer(message.data, dtype=np.uint8)
+    if data.size != height * step:
+        raise ValueError(f"payload of {data.size} bytes does not match {height}x{step}")
+    return data.reshape(height, step)[:, : width * 3].reshape(height, width, 3)
 
 
 class LatestImageStore:
@@ -85,7 +112,6 @@ class RosImageSubscriber:
     def start(self) -> None:
         try:
             import rclpy
-            from cv_bridge import CvBridge
             from rclpy.executors import SingleThreadedExecutor
             from rclpy.node import Node
             from rclpy.qos import (
@@ -97,7 +123,7 @@ class RosImageSubscriber:
             from sensor_msgs.msg import Image
         except ImportError as exc:
             raise RuntimeError(
-                "ROS 2 Jazzy, sensor_msgs, and cv_bridge must be sourced on the robot host"
+                "ROS 2 Jazzy and sensor_msgs must be sourced on the robot host"
             ) from exc
 
         self._rclpy = rclpy
@@ -106,7 +132,6 @@ class RosImageSubscriber:
             self._owns_rclpy = True
 
         store = self.store
-        bridge = CvBridge()
 
         class ImageNode(Node):
             def __init__(self) -> None:
@@ -126,16 +151,11 @@ class RosImageSubscriber:
 
             def callback(self, message: Any) -> None:
                 try:
-                    if message.encoding != "rgb8":
-                        raise ValueError(f"expected rgb8, received {message.encoding!r}")
                     if message.width != 640 or message.height != 480:
                         raise ValueError(
                             f"expected 640x480, received {message.width}x{message.height}"
                         )
-                    rgb = np.asarray(
-                        bridge.imgmsg_to_cv2(message, desired_encoding="rgb8"),
-                        dtype=np.uint8,
-                    )
+                    rgb = decode_rgb8(message)
                     source_ns = int(message.header.stamp.sec) * 1_000_000_000
                     source_ns += int(message.header.stamp.nanosec)
                     store.update(rgb, source_ns, time.monotonic_ns())
@@ -166,3 +186,157 @@ class RosImageSubscriber:
         self._executor = None
         self._node = None
         self._thread = None
+
+
+@dataclass(frozen=True)
+class StreamHealthReport:
+    message_count: int
+    duration_s: float
+    fps: float
+    median_gap_ms: float
+    max_gap_ms: float
+    stale_fraction: float
+    problems: tuple[str, ...]
+
+    @property
+    def healthy(self) -> bool:
+        return not self.problems
+
+    def summary(self) -> str:
+        lines = [
+            f"camera stream: {self.message_count} msgs in {self.duration_s:.1f} s"
+            f" -> {self.fps:.1f} fps",
+            f"gaps: median {self.median_gap_ms:.1f} ms, max {self.max_gap_ms:.0f} ms;"
+            f" stale-time {self.stale_fraction * 100:.3f}%",
+            "verdict: HEALTHY" if self.healthy else "verdict: UNHEALTHY",
+        ]
+        lines.extend(f"  problem: {problem}" for problem in self.problems)
+        return "\n".join(lines)
+
+
+def evaluate_stream_health(
+    receipt_monotonic_ns: Sequence[int],
+    duration_s: float,
+    *,
+    max_age_s: float = HEALTH_MAX_AGE_S,
+    max_stale_fraction: float = HEALTH_MAX_STALE_FRACTION,
+    max_gap_s: float = HEALTH_MAX_GAP_S,
+    min_fps: float = HEALTH_MIN_FPS,
+    extra_problems: Sequence[str] = (),
+) -> StreamHealthReport:
+    """Judge measured frame receipt times against the episode-survival gate.
+
+    `stale_fraction` is the share of wall time during which the newest
+    available frame was already older than `max_age_s` — exactly the condition
+    that makes a 5 Hz recording tick discard the active episode.
+    """
+    problems = list(extra_problems)
+    receipts = np.asarray(receipt_monotonic_ns, dtype=np.int64)
+    if receipts.size < 2:
+        problems.append(
+            f"received {receipts.size} messages in {duration_s:.1f} s; expected a stream"
+        )
+        return StreamHealthReport(
+            message_count=int(receipts.size),
+            duration_s=float(duration_s),
+            fps=0.0,
+            median_gap_ms=float("nan"),
+            max_gap_ms=float("nan"),
+            stale_fraction=1.0,
+            problems=tuple(problems),
+        )
+
+    gaps_s = np.diff(receipts) / 1e9
+    total_s = float(receipts[-1] - receipts[0]) / 1e9
+    fps = receipts.size / duration_s if duration_s > 0 else 0.0
+    stale_fraction = float(np.clip(gaps_s - max_age_s, 0.0, None).sum() / total_s) if total_s > 0 else 1.0
+    max_gap_s_measured = float(gaps_s.max())
+
+    if fps < min_fps:
+        problems.append(f"rate {fps:.1f} fps is below the {min_fps:.0f} fps minimum")
+    if max_gap_s_measured > max_gap_s:
+        problems.append(
+            f"largest delivery gap {max_gap_s_measured * 1000:.0f} ms exceeds"
+            f" {max_gap_s * 1000:.0f} ms"
+        )
+    if stale_fraction > max_stale_fraction:
+        problems.append(
+            f"newest frame older than {max_age_s:.2f} s for {stale_fraction * 100:.3f}%"
+            f" of the time (limit {max_stale_fraction * 100:.3f}%); episodes would"
+            " frequently be discarded"
+        )
+
+    return StreamHealthReport(
+        message_count=int(receipts.size),
+        duration_s=float(duration_s),
+        fps=float(fps),
+        median_gap_ms=float(np.median(gaps_s) * 1000),
+        max_gap_ms=max_gap_s_measured * 1000,
+        stale_fraction=stale_fraction,
+        problems=tuple(problems),
+    )
+
+
+def measure_stream_health(
+    topic: str = "/camera/camera/color/image_raw",
+    duration_s: float = 15.0,
+    *,
+    max_age_s: float = HEALTH_MAX_AGE_S,
+) -> StreamHealthReport:
+    """Subscribe for `duration_s` and gate the live stream (own ROS context).
+
+    Uses a private rclpy context so it can run before, and independently of,
+    `RosImageSubscriber`. Also validates the first message's encoding/shape.
+    """
+    try:
+        import rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        from rclpy.qos import (
+            QoSDurabilityPolicy,
+            QoSHistoryPolicy,
+            QoSProfile,
+            QoSReliabilityPolicy,
+        )
+        from sensor_msgs.msg import Image
+    except ImportError as exc:
+        raise RuntimeError(
+            "ROS 2 Jazzy and sensor_msgs must be sourced on the robot host"
+        ) from exc
+
+    context = rclpy.Context()
+    rclpy.init(args=None, context=context)
+    receipts: list[int] = []
+    format_problems: list[str] = []
+
+    def callback(message: Any) -> None:
+        receipts.append(time.monotonic_ns())
+        if len(receipts) == 1:
+            if message.encoding != "rgb8":
+                format_problems.append(f"encoding {message.encoding!r} is not rgb8")
+            if message.width != 640 or message.height != 480:
+                format_problems.append(
+                    f"resolution {message.width}x{message.height} is not 640x480"
+                )
+
+    node = rclpy.create_node("pushbox_camera_health_probe", context=context)
+    executor = SingleThreadedExecutor(context=context)
+    try:
+        qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        node.create_subscription(Image, topic, callback, qos)
+        executor.add_node(node)
+        deadline = time.monotonic() + duration_s
+        while time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.1)
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        context.try_shutdown()
+
+    return evaluate_stream_health(
+        receipts, duration_s, max_age_s=max_age_s, extra_problems=format_problems
+    )

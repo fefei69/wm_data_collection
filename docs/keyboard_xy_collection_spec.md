@@ -140,8 +140,8 @@ ROS_IMAGE_TOPIC = "/camera/camera/color/image_raw"
 ROS_IMAGE_ENCODING = "rgb8"
 ROS_IMAGE_WIDTH = 640
 ROS_IMAGE_HEIGHT = 480
-ROS_IMAGE_FPS = 30
-MAX_IMAGE_AGE_S = 0.10
+ROS_IMAGE_FPS = 60
+MAX_IMAGE_AGE_S = 0.20
 MODEL_IMAGE_SIZE = 224
 IMAGE_TRANSFORM_PROFILE_PATH = ...
 CAMERA_PARAMETER_DUMP_PATH = ...
@@ -334,15 +334,17 @@ The image interface is:
 | Type | `sensor_msgs/msg/Image` |
 | Encoding | `rgb8` |
 | Source size | 640×480 |
-| Expected source rate | 30 fps |
+| Expected source rate | 60 fps |
 | QoS | best effort, volatile, keep last, depth 1 |
 
-Use `rclpy`, `sensor_msgs`, and `cv_bridge` from the sourced ROS installation;
-do not attempt to install `rclpy` from PyPI. Convert with
-`CvBridge.imgmsg_to_cv2(message, desired_encoding="rgb8")`. The callback must
-do only bounded work: validate the message, convert/copy it, attach timestamps,
-and atomically replace a single latest-frame slot. It must never queue an
-unbounded image backlog.
+Use `rclpy` and `sensor_msgs` from the sourced ROS installation; do not
+attempt to install `rclpy` from PyPI (`rclpy` needs `pyyaml`, declared in
+`pyproject.toml`). Do not use `cv_bridge`: the Jazzy binary is built against
+NumPy 1.x and crashes under this project's NumPy >= 2 pin. Decode the `rgb8`
+payload with NumPy only (`ros_camera.decode_rgb8`, a bounded stride-aware
+reshape). The callback must do only bounded work: validate the message,
+decode/copy it, attach timestamps, and atomically replace a single
+latest-frame slot. It must never queue an unbounded image backlog.
 
 Keep these values together for each callback:
 
@@ -360,7 +362,10 @@ fails, command a zero-delta hold, stop and discard the active episode, and
 return to idle. Do not issue the staged motion command and do not reuse a frame.
 
 On startup, wait for the topic and validate its type, `rgb8` encoding, 640×480
-shape, strictly increasing source stamps, and approximately 30 Hz delivery.
+shape, strictly increasing source stamps, and approximately 60 Hz delivery.
+The collector runs this as a startup stream-health gate (see
+`scripts/check_camera_health.py`); `--skip-camera-check` bypasses it when the
+operator accepts the risk of frequent freshness-based episode discards.
 `/camera/camera/color/camera_info` is optional provenance and is not needed by
 this no-detector collector.
 
@@ -443,7 +448,7 @@ and return to idle; never skip a tick and later resume with a timing gap. Camera
 availability does not block arrow positioning while idle because those moves
 are not logged.
 
-Use a separate rosbag2 process as the native-rate 640×480/30 fps archive. The
+Use a separate rosbag2 process as the native-rate 640×480/60 fps archive. The
 collector writes only the selected 5 Hz model frames to its per-episode preview
 MP4 and shows that exact 224×224 view live. There is no object detector or
 box-pose estimator. The RGB topic is only the world model's observation source
@@ -523,7 +528,7 @@ Hardware-free tests must verify:
   parameter dump is absent;
 - best-effort depth-1 reception retains only the newest ROS image;
 - while recording, both image timestamps belong to their exact image, command
-  time is logged separately, and a reused or older-than-0.10 s image prevents a
+  time is logged separately, and a reused or older-than-`MAX_IMAGE_AGE_S` image prevents a
   movement command and discards the episode;
 - recording is disabled until one named 640×480-to-224×224 transform profile
   is commissioned, and that profile is identical for every row;
@@ -535,7 +540,8 @@ Live commissioning, in order:
 1. Inspect the pinned Python signature of `set_cartesian_positions` on the robot
    host.
 2. Confirm the ROS topic is `sensor_msgs/msg/Image`, `rgb8`, 640×480, near
-   30 Hz, and visually inspect the exact 224×224 model transform.
+   60 Hz (`uv run scripts/check_camera_health.py` must report HEALTHY on a
+   quiet machine), and visually inspect the exact 224×224 model transform.
 3. With the tool raised, test fixed orientation, cardinals, normalized
    diagonals, opposing-key cancellation, all three speed levels, and focus-loss
    motion disablement.

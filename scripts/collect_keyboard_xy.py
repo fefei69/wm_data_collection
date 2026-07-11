@@ -29,7 +29,11 @@ except ImportError:  # pragma: no cover - exercised by direct script execution
 
 ACTION_CAP_M = 0.010
 TICK_S = 0.2
-IMAGE_MAX_AGE_S = 0.10
+# 0.20 (was 0.10): measured 2026-07-11 at 640x480x60 — typical frame age is
+# 17-35 ms, but delivery hiccups of 100-200 ms are routine, and one tick is
+# the hard ceiling anyway (each tick also requires a NEW frame). The logged
+# image_receipt/command timestamps let QA audit the true lag per row.
+IMAGE_MAX_AGE_S = 0.20
 RESET_STEP_M = 0.005
 FIXED_ORIENTATION = np.array([0.0, math.pi / 2.0, 0.0], dtype=np.float64)
 DEFAULT_MAGNITUDES = {1: 0.0025, 2: 0.005, 3: 0.010}
@@ -242,6 +246,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--y-min", required=True, type=float)
     parser.add_argument("--y-max", required=True, type=float)
     parser.add_argument("--trajectory-check-samples", required=True, type=int)
+    parser.add_argument(
+        "--skip-camera-check",
+        action="store_true",
+        help="skip the startup camera stream health gate",
+    )
+    parser.add_argument(
+        "--camera-check-seconds",
+        type=float,
+        default=15.0,
+        help="duration of the startup camera stream health gate",
+    )
     return parser
 
 
@@ -266,10 +281,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = _config_from_args(args)
     try:
         from scripts.pygame_input import HeldInput, PygameInputBackend
-        from scripts.ros_camera import LatestImageStore, RosImageSubscriber
+        from scripts.ros_camera import LatestImageStore, RosImageSubscriber, measure_stream_health
     except ImportError:  # direct-file execution
         from pygame_input import HeldInput, PygameInputBackend
-        from ros_camera import LatestImageStore, RosImageSubscriber
+        from ros_camera import LatestImageStore, RosImageSubscriber, measure_stream_health
+
+    if not args.skip_camera_check:
+        # Gate the camera stream before any arm connection or motion; a lossy
+        # stream makes the 5 Hz freshness check discard nearly every episode.
+        report = measure_stream_health(
+            duration_s=args.camera_check_seconds, max_age_s=IMAGE_MAX_AGE_S
+        )
+        print(report.summary())
+        if not report.healthy:
+            print("camera stream failed the health gate; fix the stream or rerun with --skip-camera-check")
+            return 1
 
     image_store = LatestImageStore()
     ros = RosImageSubscriber(image_store)

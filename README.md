@@ -15,7 +15,7 @@ training criteria) lives in [dataset_spec.md](dataset_spec.md).
 |---|---|
 | Leader arm | Trossen WXAI V0, `192.168.1.5` (prototype only) |
 | Follower arm | Trossen WXAI V0, `192.168.1.3` (keyboard collector) |
-| Camera (keyboard collector) | ROS 2 topic `/camera/camera/color/image_raw`; `sensor_msgs/msg/Image`, `rgb8`, 640×480 @ 30 fps |
+| Camera (keyboard collector) | ROS 2 topic `/camera/camera/color/image_raw`; `sensor_msgs/msg/Image`, `rgb8`, 640×480 @ 60 fps |
 | Camera (legacy prototype) | Direct `pyrealsense2` color stream, 640×480 @ 30 fps |
 
 IPs, gains, and dataset constants are defined at the top of each script.

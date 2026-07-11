@@ -9,6 +9,7 @@ dependencies = [
     "opencv-python>=5.0.0.93",
     "pygame>=2.6,<3",
     "pyrealsense2>=2.58.2.10647",
+    "pyyaml>=6.0",
     "stable-worldmodel==0.1.1",
     "trossen-arm>=1.9,<1.10",
 ]
