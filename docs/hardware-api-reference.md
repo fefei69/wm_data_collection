@@ -1,123 +1,183 @@
-# Hardware & API Reference
+# Hardware API Reference — Minimal Keyboard Collector
 
-Consolidated facts for the executing agent. **Verified** items come from the
-existing prototype scripts in `scripts/` and are safe to rely on.
-**Commissioning-gated** items must be confirmed on the Linux robot host before
-any live call — do not guess them, and do not enable the live path on the macOS
-dev host.
+This file records only the hardware facts needed to implement and commission
+`scripts/collect_keyboard_xy.py`.
 
 ## Rig
 
-- **Follower arm** — Trossen WXAI V0, follower end effector, IP `192.168.1.3`.
-  This is the only arm used for V1 collection.
-- **Leader arm** — WXAI V0, IP `192.168.1.5` in `collect_data.py` (some reference
-  scripts say `.2`). **Unused in V1** — park it, do not connect it.
-- **Camera** — one fixed Intel RealSense, color stream 640×480 @ 30 fps (`bgr8`),
-  mounted overhead / high-oblique so the whole arena, the box, and the tool are
-  always visible.
-- IPs, gains, and calibrated transforms belong in the gitignored
-  `config/pushbox_collection.local.toml` — never in code or the example config.
+- Follower: Trossen WXAI V0 with follower end effector, `192.168.1.3`.
+- Leader: unused by the keyboard collector.
+- Camera source: ROS 2 Jazzy topic `/camera/camera/color/image_raw`,
+  `sensor_msgs/msg/Image`, `rgb8`, 640×480 at 30 fps.
+- Dataset/control rate: 5 Hz (`0.2 s` per action).
 
-## Arm degrees of freedom
+## Existing verified calls
 
-The `_all_` API operates on **7 entries = 6 arm joints + 1 gripper**.
-`HOME_POSITIONS = [0.0, π/2, π/2, 0.0, 0.0, 0.0, 0.0]` (the last element is the
-gripper). `get_num_joints()` returns this count.
-
-## Trossen driver API — verified from the prototype scripts
+The current prototype demonstrates:
 
 ```python
-import trossen_arm
 driver = trossen_arm.TrossenArmDriver()
 driver.configure(
     trossen_arm.Model.wxai_v0,
-    trossen_arm.StandardEndEffector.wxai_v0_follower,  # follower for collection
+    trossen_arm.StandardEndEffector.wxai_v0_follower,
     "192.168.1.3",
     False,
 )
 
-# Modes (GLOBAL — one mode for every joint; no verified per-joint mode setter):
-driver.set_all_modes(trossen_arm.Mode.position)         # or Mode.external_effort
-
-# Commands — trailing scalars are (goal_time, blocking), NOT a gripper value:
-driver.set_all_positions(positions7, goal_time, blocking)            # + optional velocities7
-driver.set_all_external_efforts(efforts7, goal_time, blocking)
-
-# Reads:
-driver.get_all_positions(); driver.get_all_velocities(); driver.get_all_external_efforts()
-driver.get_cartesian_positions()   # tool pose; [0],[1] read as x,y in the prototype
+driver.set_all_modes(trossen_arm.Mode.position)
+driver.set_all_positions(positions7, goal_time, blocking)
+driver.get_cartesian_positions()
 driver.get_cartesian_velocities()
 driver.get_num_joints()
 ```
 
-Notes:
-- `set_all_modes` is **global**. Do not assume you can hold the gripper in
-  position mode while the arm is in another mode — no per-joint mode setter is
-  demonstrated by any script.
-- In the prototype the table frame **equals** the arm base frame. V1 adds a real
-  table↔base calibration (from `calibrate_table.py`, stored in the local config),
-  and all recorded targets are expressed in the table frame.
-
-## Gravity compensation — reference only, DROPPED from V1
-
-The Trossen manual-teaching pattern is:
+The normal joint-space home pose in `collect_data.py` is:
 
 ```python
-driver.set_all_modes(trossen_arm.Mode.external_effort)
-driver.set_all_external_efforts([0, 0, 0, 0, 0, 0, 0], 0.0, False)
-input("Press Enter to end gravity compensation...")
+[0.0, pi / 2, pi / 2, 0.0, 0.0, 0.0, 0.0]
 ```
 
-This back-drives **all 7 DOF including the gripper** (the `0.0` is `goal_time`,
-not a gripper hold). It cannot keep the gripper holding a tool and cannot enforce
-XY-only guiding, so **V1 has no gravity / hand-guided mode**. This is documented
-here only to explain the decision; do not add such a mode.
+## Cartesian pose convention
 
-## Cartesian POSITION commands — needed by V1, commissioning-gated
+For Trossen Arm v1.9, Cartesian targets are six values:
 
-No existing script commands a Cartesian *position*. `FollowerRobot.command_xy`,
-`move_to_start`, and `park` all need `driver.set_cartesian_positions(...)`.
+```text
+[translation_x, translation_y, translation_z,
+ angle_axis_x, angle_axis_y, angle_axis_z]
+```
 
-- Per the Trossen v1.9 API, a Cartesian target is a **6-vector
-  `[x, y, z, ax, ay, az]`** — translation + angle-axis, in the base frame.
-- The **exact Python signature is UNVERIFIED**: argument order, any interpolation
-  flag, `goal_time`, `blocking`, and the trajectory-check setting. Confirm it on
-  the robot host (plan Task 4 Step 4 and Task 10) before enabling the live call.
-  The fake driver in tests defines this contract; make the real adapter match
-  whatever the pinned binding actually exposes.
-- Cartesian motion can **fault near singularities** — reject/handle IK and
-  command-tracking failures.
+The pose is measured in the **robot base frame**. The official Cartesian demo
+identifies the WXAI base directions as:
 
-## RealSense — verified from the prototype
+```text
++X forward     -X backward
++Y left        -Y right
++Z up          -Z down
+```
+
+The table plane is therefore base X/Y and fixed height is base Z. Tool
+orientation never changes the meaning of the first three values.
+
+The fixed orientation requested for collection is:
 
 ```python
-import pyrealsense2 as rs
-pipeline = rs.pipeline(); config = rs.config()
-config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-pipeline.start(config)
+[0.0, pi / 2, 0.0]
 ```
 
-Frame processing (reuse `process_frame` in `collect_data.py` exactly):
-640×480 BGR → center **square crop** → resize to **224×224** → BGR→RGB `uint8`.
+It maps tool `+X` down, tool `+Y` left, and tool `+Z` forward.
 
-**Spec §1 requires locking exposure, white balance, focus, and gain.** The
-prototype leaves auto-* on (a known gap). V1's `CameraSource.lock_settings()`
-must turn every auto-* **off** and set fixed values, and `PRECHECK` must refuse
-to record while any auto-setting is still on.
+Primary references:
 
-## Dataset constants (spec + prototype)
+- [Trossen Arm v1.9.3 driver header](https://github.com/TrossenRobotics/trossen_arm/blob/v1.9.3/include/libtrossen_arm/trossen_arm.hpp#L223-L264)
+- [Trossen Arm v1.9.3 Cartesian output type](https://github.com/TrossenRobotics/trossen_arm/blob/v1.9.3/include/libtrossen_arm/trossen_arm_type.hpp#L265-L295)
+- [Trossen Arm v1.9.3 Python Cartesian demo](https://github.com/TrossenRobotics/trossen_arm/blob/v1.9.3/demos/python/cartesian_position.py#L64-L93)
 
-- Tick **0.2 s (5 Hz)**. Action cap **|Δ| ≤ 0.025 m/step**, `float32`, table
-  frame. Image **224×224×3 `uint8`**.
-- Episode length target **120–150 steps**; **hard floor 50**.
-- HDF5 columns: `pixels`, `action` (T,2), `proprio` (T,4), `state` (T,6),
-  `episode_idx`, `step_idx`, `timestamp`. Use the stable-worldmodel `HDF5Writer`
-  (dataset_spec §7) — **do not** reinvent the `ep_len`/`ep_offset` layout; prove
-  it with a loader smoke test before accepting a dataset.
+## Tool offset and height
 
-## Version pins
+If the reported 5 cm is the flange-to-pusher-tip offset, it belongs in the
+flange-to-tool transform, not in base X. Prefer configuring the tool frame at the pusher tip with Trossen's
+`t_flange_tool`. Then the Cartesian Z target is simply the measured table Z plus
+the requested tip height above it.
 
-- Python ≥ 3.12. `trossen-arm >= 1.9, < 1.10`.
-- **Pin the exact `trossen_arm` package + firmware pair on the robot host** before
-  any live Cartesian motion — the public API is actively developed; do not rely on
-  a `main`-branch signature.
+If `t_flange_tool` is identity (so the configured tool frame coincides with the
+flange) and the tip is 5 cm along tool `+X`,
+the fixed flange Z is 5 cm above the desired tip Z because tool `+X` points
+down. Verify the actual mount and configured tool frame before using that
+formula.
+
+Reference: [Trossen end-effector configuration](https://docs.trossenrobotics.com/trossen_arm/v1.9/getting_started/configuration.html).
+
+## Cartesian call contract and robot-host checks
+
+`uv.lock` currently pins `trossen-arm==1.9.3`; use that lock on the robot host or
+pin the project dependency exactly before relying on this contract. In v1.9.3,
+the Cartesian position call requires an interpolation-space argument and has
+the following logical parameters:
+
+```text
+set_cartesian_positions(
+    target6,
+    InterpolationSpace.cartesian,
+    goal_time,
+    blocking,
+    optional_feedforward_velocity,
+    optional_feedforward_acceleration,
+    num_trajectory_check_samples,
+)
+```
+
+The 5 Hz loop must explicitly use `goal_time=0.2` and `blocking=False`; otherwise
+the default blocking call can stall camera and keyboard polling. The startup
+move is instead slow, blocking, and checked. Inspect the installed binding and
+confirm:
+
+- the exact Python argument names/order and representation of optional values;
+- the chosen explicit trajectory-check sample count fits the 0.2 s tick budget;
+- what happens after an IK failure or communication timeout;
+- the current `t_flange_tool` transform and therefore where the configured tool
+  frame lies; identity means it coincides with the flange.
+
+Do not guess these from a newer branch of the library. Test first with no box
+and the tool raised.
+
+## ROS 2 Jazzy image contract
+
+The keyboard collector does not import `pyrealsense2` and does not configure
+the camera. A separate RealSense ROS node publishes:
+
+| Property | Required value |
+|---|---|
+| Topic | `/camera/camera/color/image_raw` |
+| Type | `sensor_msgs/msg/Image` |
+| Encoding | `rgb8` |
+| Width / height | 640 / 480 |
+| Expected rate | 30 fps |
+
+Source ROS before launching the collector:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+```
+
+Use `rclpy`, `sensor_msgs`, and `cv_bridge` from the Jazzy installation. The
+subscription requests best-effort reliability, volatile durability, keep-last
+history, and depth 1. This is compatible with the normal sensor-data publisher
+profile and prevents queued old frames. The application also retains only one
+atomic latest-frame slot.
+
+Convert explicitly with:
+
+```python
+bridge.imgmsg_to_cv2(message, desired_encoding="rgb8")
+```
+
+Pair every image with its ROS `header.stamp`, host `time.monotonic_ns()` receipt
+time, and a local sequence counter. Record a separate monotonic timestamp
+immediately before each arm command. A 5 Hz recording tick may use an image only
+once and only while its receipt age is at most 0.10 s. Wrong encoding/shape, a
+reused frame, or a stale frame invalidates an active episode.
+
+The required source profile is already appropriate. Changing the SDK profile
+is unnecessary unless a tested native square profile preserves at least the
+same useful field of view at 30 fps. The 4:3-to-square model transform remains
+a commissioning choice between a fixed square workspace ROI and
+aspect-preserving letterboxing. Record and freeze the selected parameters
+before collecting; never stretch 4:3 directly to 224×224 or mix transforms.
+
+The image topic cannot prove that exposure, white balance, gain, or focus is
+locked. Configure every supported control on the external RealSense publisher,
+disable its automatic modes, and save a ROS parameter dump with each collection
+session. Record fixed-focus or unsupported controls as not applicable. Discover
+the actual publisher node with `ros2 node list`, then archive its parameters
+with `ros2 param dump <publisher_node>`; parameter names vary by driver version,
+so do not guess them in the collector.
+
+The new script needs no depth topic, detector, tags, camera calibration, or
+object pose. `/camera/camera/color/camera_info` may be archived as provenance
+but is not a runtime dependency.
+
+## Gravity compensation
+
+The keyboard MVP uses position mode only. Trossen's external-effort mode
+back-drives the whole arm and does not enforce an XY-only hand-guided constraint,
+so it is out of scope.

@@ -5,7 +5,7 @@ Target: a 1-hour pilot dataset to validate the full LeWM pipeline (collection �
 Everything below is pinned to what this repo's code actually consumes
 (`HDF5Dataset`, `train.py`, `eval.py` with `stable-worldmodel==0.1.1`).
 
-Reference points: LeWM paper App. D/E (frameskip 5, 224×224, episodes 92–200 steps);
+Reference points: LeWM paper App. D/E (224×224, episodes 92–200 steps);
 WorldPlanner & FoG-MBRL papers (real-arm pushing world models trained from scratch on
 4 h of 5 Hz play with Cartesian velocity actions).
 
@@ -15,54 +15,65 @@ WorldPlanner & FoG-MBRL papers (real-arm pushing world models trained from scrat
 
 | Item | Requirement |
 |---|---|
-| Camera | One fixed RGB camera, rigidly mounted, overhead or high-oblique so the **entire arena, the box, and the EE tool are always visible** (avoid arm-body occlusions). |
+| Camera | One fixed Intel RealSense, rigidly mounted overhead or high-oblique. The collector receives ROS 2 Jazzy `sensor_msgs/msg/Image` messages from `/camera/camera/color/image_raw`; it never opens the camera with `pyrealsense2`. The camera supplies pixels only; no online detector is required. |
+| ROS image profile | `rgb8`, 640×480, 30 fps. Subscribe best-effort/volatile with keep-last depth 1 and retain only the newest message. Preserve the full source frame in the raw archive. |
 | Camera settings | **Lock exposure, white balance, focus, gain.** No auto-anything — world models are brittle to photometric drift (stable-worldmodel paper Tab. 2). |
 | Lighting | Fixed, diffuse. No windows/daylight variation if possible. |
-| Arena | Bounded planar workspace ~40×40 cm (walls or firm border) so the box cannot leave reach; plain matte surface with high contrast to the box. |
-| Box | Rigid, ~8–15 cm, light enough to push, visually distinct color. **AprilTag (36h11) on top face** + one static tag on the table for the world frame. |
-| EE tool | Rigid cylindrical pusher (PushT-style stick) mounted in place of / held by the gripper. **Fixed height** (z ≈ box mid-height), **fixed orientation** (pointing down), gripper state constant. |
+| Work area | Flat, plain matte table with high contrast to the box. A physical border is optional; when the box approaches or leaves the camera/reachable area, stop recording and reset it manually. |
+| Box | Rigid, ~8–15 cm, light enough to push, and visually distinct. No marker or online box tracking is required. |
+| EE tool | Rigid cylindrical pusher (PushT-style stick). Define the commanded frame explicitly (prefer the pusher contact point), hold its base-frame Z at a measured contact height above the table, and use angle-axis `[0, π/2, 0]`, so tool +X points down, +Y left, and +Z forward. |
 
 ## 2. Timing / frequency
 
 - **Decision rate: 5 Hz** (0.2 s per step). This is the dataset's step rate; the arm's
   internal Cartesian controller runs at its native rate underneath.
-- Rationale: matches WorldPlanner / FoG real-robot pushing; with the repo's `frameskip: 5`,
-  one model action-block = 1 s of motion and the eval `goal_offset` of 25 steps = 5 s of
-  pushing — enough for meaningful box displacement.
+- **Training frame skip: 1.** Every stored 5 Hz observation/action step is used; one model
+  transition is 0.2 s. Temporal subsampling can be evaluated later without recollecting.
+- Rationale: the raw rate matches WorldPlanner / FoG real-robot pushing while preserving
+  contact onset and release for the first LeWM baseline.
 - **Alignment contract:** at tick *t*, capture `pixels[t]`, `proprio[t]`, `state[t]`,
   **then** issue `action[t]`. So `pixels[t+1]` shows the outcome of `action[t]`.
-- Log a `timestamp` column; ticks must be uniform to ±10% (see QA §8).
+- The image callback stores the ROS `header.stamp` and host monotonic receipt time with the
+  image. At a dataset tick, consume the newest message only if it is new since the previous
+  tick and no more than 0.10 s old. Otherwise hold position and discard the active episode.
+- Ticks must be uniform to ±10% (see QA §8).
 
 ## 3. Action space — 2D Cartesian delta
 
-- `action[t] = [Δx, Δy]` **float32, meters**, in the fixed table frame: the EE displacement
+- `action[t] = [Δx, Δy]` **float32, meters**, in the robot base X/Y frame: the EE displacement
   commanded for this 0.2 s tick (equivalently velocity × 0.2 s).
-- **Cap: |Δ| ≤ 0.025 m/step** (= 12.5 cm/s). Clip before sending; **record the clipped
+- **Collected magnitudes:** 0.0025, 0.005, and 0.010 m/step, selected by keys
+  `1`, `2`, and `3`. **Cap: `norm([Δx, Δy]) ≤ 0.010 m/step`** (= 5 cm/s).
+  Normalize simultaneous-arrow diagonals so their total norm equals the selected
+  magnitude, then project to the workspace before sending. **Record the bounded
   command actually sent** (not the raw teleop input, not the achieved motion).
-- z, orientation, gripper: constant, handled by the controller, **not** in the action vector.
+- Base Z, orientation, and gripper: constant, handled by the controller, **not** in the action vector.
+- Trossen translations remain base-frame coordinates after rotating the tool. For the standard
+  WXAI convention, base +X is forward, +Y is left, and +Z is up; planar movement is X/Y and
+  height is Z.
 - No joint space (CEM samples Gaussians — unsafe + wastes model capacity on kinematics),
   no quaternions (not normalizable/sampleable; latent WMs capture rotation poorly).
 - Units don't need pre-normalization — the pipeline z-scores per column
   (`utils.get_column_normalizer` for training, `StandardScaler` in `eval.py`).
   Just be **consistent**.
-- `train.py` auto-sets `action_encoder.input_dim = frameskip × action_dim` (= 5×2 = 10),
+- `train.py` auto-sets `action_encoder.input_dim = frameskip × action_dim` (= 1×2 = 2),
   so a 2D action needs **zero model-config changes**.
 
 ## 4. Observation columns
 
 | Column | Shape/dtype | Content |
 |---|---|---|
-| `pixels` | `(224, 224, 3) uint8` | RGB. Capture ≥ 640×480, center square-crop, resize to 224×224 (record crop/resize params and never change them mid-dataset). |
-| `proprio` | `(4,) float32` | `[ee_x, ee_y, ee_vx, ee_vy]` — EE position (m) and velocity (m/s) in the table frame (mirrors PushT's layout). |
-| `state` | `(6,) float32` | `[ee_x, ee_y, box_x, box_y, cos(box_yaw), sin(box_yaw)]` from AprilTag tracking. Used for normalization stats, latent probing, and analysis — **not** by the training loss. |
+| `pixels` | `(224, 224, 3) uint8` | RGB derived from the 640×480 ROS image. The 4:3-to-square transform is deliberately not selected in this revision: during commissioning, compare a fixed square ROI that contains the entire useful workspace against aspect-preserving letterboxing, choose one, record its exact parameters, and freeze it before the first saved pilot episode. Never stretch 4:3 directly to 1:1 or mix transforms within a dataset. |
+| `proprio` | `(4,) float32` | `[ee_x, ee_y, ee_vx, ee_vy]` — EE base-frame X/Y position (m) and velocity (m/s). |
+| `state` | `(6,) float32` | `[ee_x, ee_y, NaN, NaN, NaN, NaN]`. Keep the compatible shape; box pose is intentionally not measured online and is not used by the training loss. |
 | `episode_idx` | `() int64` | Episode counter, monotone across the file. |
 | `step_idx` | `() int64` | 0-based step within the episode. |
-| `timestamp` | `() float64` | Unix time at image capture (QA only; extra columns are allowed and ignored by configs). |
+| `image_timestamp_ns` | `() int64` | ROS `Image.header.stamp` converted to nanoseconds. |
+| `image_receipt_monotonic_ns` | `() int64` | Host monotonic time when that exact ROS message was received; used for freshness QA. |
+| `command_monotonic_ns` | `() int64` | Host monotonic time immediately before issuing `action[t]`; used for the 5 Hz cadence and image-to-command latency QA. |
 
-**Missed tag detections:** write `NaN` into the box fields of `state`. Both `train.py`
-(`utils.py:29`) and `eval.py` drop NaN rows before fitting normalizers, and the LeWM loss
-only consumes `pixels` + `action`, so NaNs are end-to-end safe. Optionally interpolate gaps
-≤ 3 frames; drop any episode with > 5% missing detections.
+The box fields of `state` are always `NaN` in this MVP. The LeWM loss consumes
+`pixels` + `action`; do not add a detector solely to populate auxiliary state.
 
 ## 5. Episode structure
 
@@ -70,27 +81,38 @@ only consumes `pixels` + `action`, so NaNs are end-to-end safe. Optionally inter
   ≥ `goal_offset` 25 + margin), soft ceiling ~250.
 - **1 hour of robot time = 18,000 steps ≈ 125–150 episodes.** With ~10–15 s manual
   re-randomization between episodes, budget ~1.5 h wall clock.
-- Between episodes: re-randomize **box position over the whole arena, box yaw uniformly,
+- Between episodes: manually vary **box position over the useful work area, box yaw,
   and the EE start pose**. No resets *within* an episode.
-- Training windows span `num_steps × frameskip = 4 × 5 = 20` steps, so every episode ≥ 50
+- Training windows span `num_steps × frameskip = 4 × 1 = 4` steps, so every episode ≥ 50
   steps yields plenty of samples; episode boundaries are handled by the loader
   (NaN-padded actions are zeroed in `train.py:25`).
 
 ## 6. Collection policy (what the play should look like)
 
-Teleop (or scripted random pusher) doing **unstructured, high-entropy play** — no task
+Arrow-key teleop doing **unstructured, high-entropy play** — no task
 success required, no demonstration quality bar (LeWM §3.1 allows "pseudo-expert or
 exploratory" data; both real-robot reference papers used pure play):
 
 - Repeat: approach the box from a random direction → push through contact 5–20 cm →
-  release / reposition → repeat. Vary speed within the cap.
+  release / reposition → repeat. Vary direction and push duration.
 - Cover **all four faces and the corners** of the box (corner pushes produce rotation —
   you need rotational dynamics in the data).
+- Cover all eight commanded directions and all three speed levels throughout
+  both contact and contact-free motion; do not let normal-speed cardinal moves
+  dominate the dataset.
 - **~10–20% contact-free EE motion** (the model must learn that no contact ⇒ box stays).
-- Coverage goals for the hour: box visits all arena quadrants; box yaw covers the full
+- Coverage goals for the hour: box visits all work-area quadrants; box yaw covers the full
   circle; EE approaches from all sides; typical 5 s contact window moves the box ≥ 3–5 cm
   or rotates it ≥ 10°.
 - Keep hands/faces out of frame; if you must intervene mid-episode, end the episode.
+
+The local Pygame input tracks held-key state, so simultaneous arrows produce the
+eight compass directions. Diagonals are normalized rather than moving `sqrt(2)`
+faster. Together with zero and the three magnitudes, this gives 25 deliberately
+covered primitive actions. This is still a finite training set: continuous CEM
+relies on interpolation between those actions, must project every candidate to
+`norm(action) <= 0.010`, and requires offline held-out validation before any
+robot execution.
 
 ## 7. File format & writer
 
@@ -116,34 +138,41 @@ with swm.data.HDF5Writer(
         "state":       ep_state.astype(np.float32),    # (T,6)
         "episode_idx": np.full(T, ep_id, np.int64),    # (T,)
         "step_idx":    np.arange(T, dtype=np.int64),   # (T,)
-        "timestamp":   ep_ts.astype(np.float64),       # (T,)
+        "image_timestamp_ns": ep_image_ts.astype(np.int64),  # (T,)
+        "image_receipt_monotonic_ns": ep_receipt_ts.astype(np.int64), # (T,)
+        "command_monotonic_ns": ep_command_ts.astype(np.int64), # (T,)
     })
 ```
 
 Buffer each episode in RAM (150 steps × 150 KB ≈ 23 MB) and write on episode end.
 Expected file size: ~2.7 GB uncompressed (fine for the pilot; the writer doesn't compress).
-**Also keep the raw camera stream** (video/rosbag at native resolution) so you can regenerate
-the h5 with different crops/rates without re-collecting.
+**Also record the raw ROS image topic with rosbag2 at 640×480/30 fps.** The
+collector may write a separate 5 Hz per-episode model-view MP4 for quick review,
+but that preview is not the native-rate archive. The bag lets you regenerate the
+HDF5 after the image-transform commissioning comparison without re-collecting.
 
 ## 8. QA checklist (run before training)
 
 1. **Alignment:** `proprio[t+1, :2] − proprio[t, :2] ≈ action[t]` (correlation > 0.9 on
    contact-free segments). If it correlates with `action[t±1]` instead, your logging is
    off by one tick.
-2. **Timing:** `diff(timestamp)` = 0.20 ± 0.02 s, no gaps > 0.3 s inside episodes.
-3. **Tag health:** box-pose detection rate > 95%; no episode > 5% NaN.
-4. **Visual sanity:** random 20 frames — box+EE fully visible, exposure constant, no motion
+2. **Timing:** `diff(command_monotonic_ns)` is 0.20 ± 0.02 s; source stamps are
+   strictly increasing; and `command_monotonic_ns - image_receipt_monotonic_ns`
+   is between 0 and 0.10 s for every selected image.
+3. **State contract:** all four unmeasured box-state values are `NaN`; EE X/Y remain finite.
+4. **Visual sanity:** random 20 frames — box+EE are usefully visible, exposure constant, no motion
    blur that hides the box edge.
-5. **Coverage:** heat-map `state[:, 2:4]` (box position) — should fill the arena, not one blob;
-   histogram of `atan2(sin,cos)` yaw — roughly uniform.
+5. **Manual coverage review:** sample episode videos and confirm varied box positions/yaws,
+   approach sides, push directions, contact durations, and deliberate no-contact motion.
 6. **Loader smoke test:**
-   `HDF5Dataset('pushbox_pilot_train', frameskip=5, num_steps=4, keys_to_load=[...])`
+   `HDF5Dataset('pushbox_pilot_train', frameskip=1, num_steps=4, keys_to_load=['pixels', 'action'])`
    loads, and one `DataLoader` batch has `pixels (B,4,3,224,224)`-ish shapes post-transform.
 
 ## 9. Training & pilot success criteria
 
 Create `config/train/data/pushbox.yaml` (copy of `pusht.yaml` with
-`name: pushbox_pilot_train.h5`), then:
+`name: pushbox_pilot_train.h5`, `frameskip: 1`, and
+`keys_to_load: [pixels, action]`), then:
 
 ```bash
 python train.py data=pushbox trainer.max_epochs=100
@@ -156,13 +185,13 @@ reasonable pilot budget (batch 128 may also need lowering if windows < 128×step
 The pilot **passes** if:
 1. `pred_loss` and `sigreg_loss` both decrease smoothly and plateau (cf. paper Fig. 18);
    sigreg drops sharply early.
-2. **Linear probe** of box `(x, y)` (and cos/sin yaw) from frozen latents reaches high
-   correlation (paper achieves r ≈ 0.99 position / 0.90 angle on sim PushT with full data —
-   expect worse at 1 h, but position r ≳ 0.8 says the latent sees the box).
-3. Optional smoke test of planning: load the checkpoint via
-   `load_pretrained('<run>/weights_epoch_N.pt')`, build `WorldModelPolicy` + `CEMSolver`,
-   feed a live camera frame + a goal image from the dataset, and check the planned 2D
-   deltas are sane (bounded, pointed toward the box) before ever executing on the arm.
+2. Short held-out video rollouts are visually coherent enough to preserve the box and
+   predict the qualitative result of contact versus no contact. A quantitative box-pose
+   probe requires labels collected separately and is not part of this MVP.
+3. Optional offline CEM smoke test: project candidates into the 0.010 m action
+   disk and check held-out cardinal, diagonal, and intermediate actions. Do not
+   execute interpolated actions on the arm until prediction checks and separate
+   no-contact commissioning pass.
 
 Real-robot closed-loop eval can't reuse `eval.py`'s dataset-driven protocol (`_set_state`
 teleports don't exist in reality) — plan a small driver script that resets the box manually,

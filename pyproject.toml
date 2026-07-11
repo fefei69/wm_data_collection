@@ -7,6 +7,8 @@ dependencies = [
     "imageio-ffmpeg>=0.6.0",
     "numpy>=2.5.1",
     "opencv-python>=5.0.0.93",
+    "pygame>=2.6,<3",
     "pyrealsense2>=2.58.2.10647",
+    "stable-worldmodel==0.1.1",
     "trossen-arm>=1.9,<1.10",
 ]
