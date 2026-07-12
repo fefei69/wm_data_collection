@@ -31,12 +31,11 @@ except ImportError:  # pragma: no cover - exercised by direct script execution
 
 ACTION_CAP_M = 0.010
 TICK_S = 0.2
-# A tick this late means the loop blocked (episode save, host stall) rather
-# than ordinary polling jitter (< 33 ms at the 30 fps UI clock). The schedule
-# then realigns instead of firing a 30 Hz catch-up burst, and an active episode
-# is discarded per the spec: never skip a tick and later resume with a timing
-# gap (docs/keyboard_xy_collection_spec.md §8).
-TICK_MAX_LATENESS_S = TICK_S / 2
+# Keep the online gate identical to dataset_spec.md §8 and the offline checker:
+# command intervals must be 0.20 +/- 0.02 s. The preview has an independent
+# 30 Hz deadline, so UI pacing cannot consume this tolerance.
+TICK_TOLERANCE_S = 0.02
+UI_SLEEP_MAX_S = 0.005
 # The freshness bound is owned by scripts/ros_camera.py so the health gate and
 # the recording tick can never disagree; IMAGE_MAX_AGE_S is the spec's name for
 # it (docs/hardware-api-reference.md). 0.20 (was 0.10): measured 2026-07-11 at
@@ -49,6 +48,24 @@ RESET_STEP_M = 0.005
 RESET_TOLERANCE_M = 0.002  # placeholder pending commissioning; see HOLD_POSITION_TOLERANCE_M in the spec
 FIXED_ORIENTATION = np.array([0.0, math.pi / 2.0, 0.0], dtype=np.float64)
 DEFAULT_MAGNITUDES = {1: 0.0025, 2: 0.005, 3: 0.010}
+
+
+def advance_tick_deadline(deadline_s: float, now_s: float) -> tuple[float, bool]:
+    """Advance one tick, or realign after a deadline miss beyond QA tolerance."""
+    late = float(now_s) - float(deadline_s)
+    if late > TICK_TOLERANCE_S:
+        return float(now_s) + TICK_S, True
+    return float(deadline_s) + TICK_S, False
+
+
+def command_interval_is_valid(previous_ns: int | None, current_ns: int) -> bool:
+    """Return whether consecutive command stamps satisfy the dataset contract."""
+    if previous_ns is None:
+        return True
+    interval_ns = int(current_ns) - int(previous_ns)
+    target_ns = round(TICK_S * 1e9)
+    tolerance_ns = round(TICK_TOLERANCE_S * 1e9)
+    return abs(interval_ns - target_ns) <= tolerance_ns
 
 
 def accepted_target(
@@ -335,6 +352,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     next_recording_report_s = 5
     target_xy = np.array(config.start_xy, dtype=np.float64)
     previous_sequence: int | None = None
+    previous_command_ns: int | None = None
     preview_sequence: int | None = None
     episode_id = 0
     recorder = EpisodeRecorder(output_h5=config.output_h5)
@@ -345,6 +363,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     def discard_episode(reason: str | None = None) -> None:
         """Single teardown path for every way an episode can be abandoned."""
         nonlocal recording, recording_started_at, pending_stop, resetting
+        nonlocal previous_command_ns
         if recording and recording_started_at is not None:
             elapsed = time.monotonic() - recording_started_at
             suffix = f": {reason}" if reason else ""
@@ -354,6 +373,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         recording_started_at = None
         pending_stop = False
         resetting = False
+        previous_command_ns = None
 
     if not config.enforce_xy_limits:
         print(
@@ -369,6 +389,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ros.start()
         pygame_input.start()
         next_tick = time.monotonic()
+        next_render = next_tick
         while not quit_requested:
             events = pygame_input.poll()
             if events.quit_requested:
@@ -396,6 +417,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     # The use-once rule is per episode: a frame consumed by the
                     # previous episode may still seed this one if fresh by age.
                     previous_sequence = None
+                    previous_command_ns = None
                     recording = True
                     recording_started_at = time.monotonic()
                     next_recording_report_s = 5
@@ -411,10 +433,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             now = time.monotonic()
             if now >= next_tick:
-                lateness_s = now - next_tick
-                next_tick += TICK_S
-                if lateness_s > TICK_MAX_LATENESS_S:
-                    next_tick = now + TICK_S
+                next_tick, missed_tick = advance_tick_deadline(next_tick, now)
+                if missed_tick:
                     if recording:
                         discard_episode("tick overran the 5 Hz schedule")
                 held_action = pygame_input.action()
@@ -465,28 +485,36 @@ def main(argv: Sequence[str] | None = None) -> int:
                         preview = pixels
                         preview_sequence = snapshot.sequence
                         pose = arm.pose()
-                        row = {
-                            "pixels": pixels,
-                            "proprio": np.r_[pose[:2], arm.velocities()[:2]].astype(np.float32),
-                            "state": np.r_[pose[:2], np.full(4, np.nan)].astype(np.float32),
-                            "action": actual.astype(np.float32),
-                            "image_timestamp_ns": snapshot.source_timestamp_ns,
-                            "image_receipt_monotonic_ns": snapshot.receipt_monotonic_ns,
-                            "command_monotonic_ns": time.monotonic_ns(),
-                        }
-                        recorder.send_and_commit(
-                            row,
-                            lambda: arm.send_cartesian(np.r_[target, config.fixed_z, FIXED_ORIENTATION]),
-                        )
-                        target_xy = target
-                        if pending_stop:
-                            recorder.finish(save=True)
-                            if recording_started_at is not None:
-                                elapsed = time.monotonic() - recording_started_at
-                                print(f"episode saved: {elapsed:.1f} seconds")
-                            recording = False
-                            recording_started_at = None
-                            pending_stop = False
+                        proprio = np.r_[pose[:2], arm.velocities()[:2]].astype(np.float32)
+                        command_ns = time.monotonic_ns()
+                        if not command_interval_is_valid(previous_command_ns, command_ns):
+                            discard_episode("command cadence left the 0.20 +/- 0.02 s window")
+                        else:
+                            row = {
+                                "pixels": pixels,
+                                "proprio": proprio,
+                                "state": np.r_[pose[:2], np.full(4, np.nan)].astype(np.float32),
+                                "action": actual.astype(np.float32),
+                                "image_timestamp_ns": snapshot.source_timestamp_ns,
+                                "image_receipt_monotonic_ns": snapshot.receipt_monotonic_ns,
+                                "command_monotonic_ns": command_ns,
+                            }
+                            recorder.send_and_commit(
+                                row,
+                                lambda: arm.send_cartesian(
+                                    np.r_[target, config.fixed_z, FIXED_ORIENTATION]
+                                ),
+                            )
+                            previous_command_ns = command_ns
+                            target_xy = target
+                            if pending_stop:
+                                recorder.finish(save=True)
+                                if recording_started_at is not None:
+                                    elapsed = time.monotonic() - recording_started_at
+                                    print(f"episode saved: {elapsed:.1f} seconds")
+                                recording = False
+                                recording_started_at = None
+                                pending_stop = False
                 else:
                     # Idle: keep the live preview current so the operator can
                     # frame the box/pusher before recording (workflow step 1).
@@ -514,7 +542,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                             target_xy = reset_target
                 if not recording and quit_requested:
                     break
-            pygame_input.render(preview, "recording" if recording else "idle")
+            now = time.monotonic()
+            if now >= next_render:
+                pygame_input.render(preview, "recording" if recording else "idle")
+                next_render = now + 1.0 / pygame_input.ui_fps
+            sleep_s = min(next_tick, next_render) - time.monotonic()
+            if sleep_s > 0.0:
+                time.sleep(min(sleep_s, UI_SLEEP_MAX_S))
     finally:
         if recording:
             # Best-effort discard: clearing the buffer must never mask a

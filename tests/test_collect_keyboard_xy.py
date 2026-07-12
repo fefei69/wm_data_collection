@@ -5,6 +5,8 @@ from scripts.collect_keyboard_xy import (
     CollectorConfig,
     EpisodeRecorder,
     accepted_target,
+    advance_tick_deadline,
+    command_interval_is_valid,
 )
 
 
@@ -71,3 +73,21 @@ def test_recorder_requires_zero_terminal_action():
     recorder.append({"action": np.array([0.005, 0.0], dtype=np.float32)})
     with pytest.raises(ValueError, match="zero"):
         recorder.finish(save=False)
+
+
+def test_tick_deadline_advances_normally_and_realigns_after_tolerance():
+    deadline, missed = advance_tick_deadline(10.0, 10.019)
+    assert deadline == pytest.approx(10.2)
+    assert missed is False
+
+    deadline, missed = advance_tick_deadline(10.0, 10.021)
+    assert deadline == pytest.approx(10.221)
+    assert missed is True
+
+
+def test_command_interval_uses_the_same_twenty_ms_tolerance_as_qa():
+    assert command_interval_is_valid(None, 1_000_000_000)
+    assert command_interval_is_valid(1_000_000_000, 1_180_000_000)
+    assert command_interval_is_valid(1_000_000_000, 1_220_000_000)
+    assert not command_interval_is_valid(1_000_000_000, 1_179_999_999)
+    assert not command_interval_is_valid(1_000_000_000, 1_220_000_001)

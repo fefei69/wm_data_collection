@@ -1,6 +1,8 @@
+from types import SimpleNamespace
+
 import numpy as np
 
-from scripts.pygame_input import HeldInput
+from scripts.pygame_input import HeldInput, PygameInputBackend
 
 
 MAGNITUDES = {1: 0.0025, 2: 0.005, 3: 0.010}
@@ -31,3 +33,35 @@ def test_opposing_held_arrows_cancel():
         input_state.update_held({"up": True, "down": True}),
         [0.0, 0.0],
     )
+
+
+def test_render_does_not_pace_the_control_loop():
+    class Surface:
+        def fill(self, *_args):
+            pass
+
+        def blit(self, *_args):
+            pass
+
+    class Clock:
+        calls = 0
+
+        def tick(self, _fps):
+            self.calls += 1
+
+    backend = PygameInputBackend(HeldInput(MAGNITUDES))
+    clock = Clock()
+    backend._pygame = SimpleNamespace(
+        image=SimpleNamespace(frombuffer=lambda *_args: object()),
+        transform=SimpleNamespace(scale=lambda image, _size: image),
+        Surface=lambda *_args: Surface(),
+        SRCALPHA=1,
+        display=SimpleNamespace(flip=lambda: None),
+    )
+    backend._screen = Surface()
+    backend._font = SimpleNamespace(render=lambda *_args: object())
+    backend._clock = clock
+
+    backend.render(np.zeros((224, 224, 3), dtype=np.uint8), "idle")
+
+    assert clock.calls == 0

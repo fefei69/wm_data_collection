@@ -82,7 +82,6 @@ class PygameInputBackend:
         self.ui_fps = int(ui_fps)
         self._pygame: Any = None
         self._screen: Any = None
-        self._clock: Any = None
         self._font: Any = None
 
     def start(self) -> None:
@@ -94,7 +93,6 @@ class PygameInputBackend:
         self._pygame = pygame
         self._screen = pygame.display.set_mode((self.size * 2, self.size * 2))
         pygame.display.set_caption("Push-box keyboard collector")
-        self._clock = pygame.time.Clock()
         self._font = pygame.font.Font(None, 24)
 
     def poll(self) -> PygameEvents:
@@ -167,13 +165,10 @@ class PygameInputBackend:
         overlay.blit(self._font.render(status, True, (255, 255, 255)), (8, 5))
         self._screen.blit(overlay, (0, 0))
         pygame.display.flip()
-        if self._clock is not None:
-            self._clock.tick(self.ui_fps)
 
     def close(self) -> None:
         if self._pygame is not None:
             self._pygame.quit()
         self._pygame = None
         self._screen = None
-        self._clock = None
         self._font = None
