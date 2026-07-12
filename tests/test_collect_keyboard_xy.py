@@ -8,6 +8,12 @@ from scripts.collect_keyboard_xy import (
 )
 
 
+def test_default_config_validates_with_limits_enforced():
+    # Guards against the defaults drifting apart again (start_xy used to sit
+    # outside x_bounds, making every default-constructed config self-reject).
+    CollectorConfig().validate()
+
+
 def test_config_rejects_missing_commissioning_files(tmp_path):
     with pytest.raises(ValueError, match="transform profile"):
         CollectorConfig.from_paths(

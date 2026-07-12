@@ -109,7 +109,8 @@ class RosImageSubscriber:
     ) -> None:
         self.store = store
         self.topic = topic
-        self.error: Exception | None = None
+        self._error_lock = threading.Lock()
+        self._error: Exception | None = None
         self._rclpy: Any = None
         self._node: Any = None
         self._executor: Any = None
@@ -167,7 +168,7 @@ class RosImageSubscriber:
                     source_ns += int(message.header.stamp.nanosec)
                     store.update(rgb, source_ns, time.monotonic_ns())
                 except Exception as exc:  # keep executor alive; main loop checks error
-                    subscriber.error = exc
+                    subscriber._record_error(exc)
 
         self_topic = self.topic
         subscriber = self
@@ -180,6 +181,16 @@ class RosImageSubscriber:
             daemon=True,
         )
         self._thread.start()
+
+    def _record_error(self, exc: Exception) -> None:
+        with self._error_lock:
+            self._error = exc
+
+    def take_error(self) -> Exception | None:
+        """Return and clear the most recent subscriber callback error."""
+        with self._error_lock:
+            error, self._error = self._error, None
+            return error
 
     def stop(self) -> None:
         if self._executor is not None:

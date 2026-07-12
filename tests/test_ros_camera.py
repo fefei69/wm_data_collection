@@ -3,7 +3,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from scripts.ros_camera import LatestImageStore, decode_rgb8, evaluate_stream_health
+from scripts.ros_camera import (
+    LatestImageStore,
+    RosImageSubscriber,
+    decode_rgb8,
+    evaluate_stream_health,
+)
 
 
 def _image_message(height=480, width=640, step=None, encoding="rgb8", pixels=None):
@@ -59,6 +64,15 @@ def test_latest_image_store_rejects_stale_or_future_receipt_time():
     assert snapshot is not None
     assert not store.accept(snapshot, previous_sequence=0, now_monotonic_ns=201_000_001, max_age_s=0.1)
     assert not store.accept(snapshot, previous_sequence=0, now_monotonic_ns=50, max_age_s=0.1)
+
+
+def test_subscriber_take_error_returns_and_clears():
+    subscriber = RosImageSubscriber(LatestImageStore())
+    assert subscriber.take_error() is None
+    error = ValueError("bad frame")
+    subscriber._record_error(error)
+    assert subscriber.take_error() is error
+    assert subscriber.take_error() is None
 
 
 def _receipts_ns(gaps_s):

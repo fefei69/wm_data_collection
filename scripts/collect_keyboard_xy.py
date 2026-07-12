@@ -73,7 +73,9 @@ class CollectorConfig:
     follower_ip: str = "192.168.1.3"
     fixed_z: float = 0.20
     safe_z: float = 0.30
-    start_xy: tuple[float, float] = (0.30, 0.0)
+    # Commissioned start pose (matches run_keyboard_collection.sh); must lie
+    # inside the default bounds so a default config validates.
+    start_xy: tuple[float, float] = (0.282, 0.0185)
     x_bounds: tuple[float, float] = (0.18, 0.29)
     y_bounds: tuple[float, float] = (-0.12, 0.12)
     trajectory_check_samples: int = 10
@@ -238,19 +240,19 @@ class FollowerArmAdapter:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path("pushbox_keyboard.h5"))
-    parser.add_argument("--video-dir", type=Path, default=Path("output_videos"))
+    parser.add_argument("--output", type=Path, default=CollectorConfig.output_h5)
+    parser.add_argument("--video-dir", type=Path, default=CollectorConfig.output_video_dir)
     parser.add_argument("--transform-profile", required=True, type=Path)
     parser.add_argument("--camera-params", required=True, type=Path)
-    parser.add_argument("--follower-ip", default="192.168.1.3")
+    parser.add_argument("--follower-ip", default=CollectorConfig.follower_ip)
     parser.add_argument("--fixed-z", required=True, type=float)
     parser.add_argument("--safe-z", required=True, type=float)
     parser.add_argument("--start-x", required=True, type=float)
     parser.add_argument("--start-y", required=True, type=float)
-    parser.add_argument("--x-min", type=float, default=0.18)
-    parser.add_argument("--x-max", type=float, default=0.29)
-    parser.add_argument("--y-min", type=float, default=-0.12)
-    parser.add_argument("--y-max", type=float, default=0.12)
+    parser.add_argument("--x-min", type=float, default=CollectorConfig.x_bounds[0])
+    parser.add_argument("--x-max", type=float, default=CollectorConfig.x_bounds[1])
+    parser.add_argument("--y-min", type=float, default=CollectorConfig.y_bounds[0])
+    parser.add_argument("--y-max", type=float, default=CollectorConfig.y_bounds[1])
     parser.add_argument("--trajectory-check-samples", required=True, type=int)
     parser.add_argument(
         "--disable-xy-limits",
@@ -325,9 +327,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     episode_id = 0
     recorder = EpisodeRecorder(output_h5=config.output_h5)
     preview = np.zeros((224, 224, 3), dtype=np.uint8)
-    last_ros_error: BaseException | None = None
     blocked_action: tuple[float, float] | None = None
     xy_bounds = (config.x_bounds, config.y_bounds) if config.enforce_xy_limits else None
+
+    def discard_episode(reason: str | None = None) -> None:
+        """Single teardown path for every way an episode can be abandoned."""
+        nonlocal recording, recording_started_at, pending_stop, resetting
+        if recording and recording_started_at is not None:
+            elapsed = time.monotonic() - recording_started_at
+            suffix = f": {reason}" if reason else ""
+            print(f"episode discarded after {elapsed:.1f} seconds{suffix}")
+        recorder.start()
+        recording = False
+        recording_started_at = None
+        pending_stop = False
+        resetting = False
 
     if not config.enforce_xy_limits:
         print(
@@ -352,14 +366,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     resetting = False
                     quit_requested = True
             if events.discard_requested:
-                if recording and recording_started_at is not None:
-                    elapsed = time.monotonic() - recording_started_at
-                    print(f"episode discarded after {elapsed:.1f} seconds")
-                recorder.start()
-                recording = False
-                recording_started_at = None
-                pending_stop = False
-                resetting = False
+                discard_episode()
             if events.save_toggle:
                 if recording:
                     pending_stop = True
@@ -374,6 +381,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         episode_id=episode_id,
                     )
                     episode_id += 1
+                    # The use-once rule is per episode: a frame consumed by the
+                    # previous episode may still seed this one if fresh by age.
+                    previous_sequence = None
                     recording = True
                     recording_started_at = time.monotonic()
                     next_recording_report_s = 5
@@ -383,15 +393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # The actual step-by-step motion happens on the 5 Hz tick below.
                 resetting = True
             if events.focus_lost:
-                if recording:
-                    if recording_started_at is not None:
-                        elapsed = time.monotonic() - recording_started_at
-                        print(f"episode discarded after {elapsed:.1f} seconds: preview lost focus")
-                    recorder.start()
-                    recording = False
-                    recording_started_at = None
-                pending_stop = False
-                resetting = False
+                discard_episode("preview lost focus")
                 # Clear held motion and immediately command a fixed-target hold.
                 arm.send_cartesian(np.r_[target_xy, config.fixed_z, FIXED_ORIENTATION])
 
@@ -415,9 +417,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     blocked_action = action_key
                 elif not motion_blocked:
                     blocked_action = None
-                if ros.error is not None and ros.error is not last_ros_error:
-                    last_ros_error = ros.error
-                    print(f"camera subscriber error: {last_ros_error}")
+                camera_error = ros.take_error()
+                if camera_error is not None:
+                    print(f"camera subscriber error: {camera_error}")
+                    if recording:
+                        # A wrong-encoding/shape frame invalidates the active
+                        # episode (docs/hardware-api-reference.md).
+                        discard_episode("camera subscriber error")
                 if recording:
                     if recording_started_at is not None:
                         elapsed = time.monotonic() - recording_started_at
@@ -435,13 +441,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     snapshot = image_store.snapshot()
                     fresh = snapshot is not None and LatestImageStore.accept(snapshot, previous_sequence, time.monotonic_ns(), IMAGE_MAX_AGE_S)
                     if not fresh:
-                        if recording_started_at is not None:
-                            elapsed = time.monotonic() - recording_started_at
-                            print(f"episode discarded after {elapsed:.1f} seconds: camera frame was stale")
-                        recorder.start()
-                        recording = False
-                        recording_started_at = None
-                        pending_stop = False
+                        discard_episode("camera frame was stale")
                     else:
                         previous_sequence = snapshot.sequence
                         pixels = config.transform_profile.apply(snapshot.rgb)
