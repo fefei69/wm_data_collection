@@ -12,10 +12,17 @@ import numpy as np
 
 # Stream-health gate defaults, derived from measured episode-survival math
 # (2026-07-11): a 150-tick episode survives with p >= 0.9 only when the newest
-# frame is older than the freshness bound for <= ~0.05% of the time.
+# frame is older than the freshness bound for <= ~0.05% of the time. Delivery
+# hiccups of 100-370 ms are routine on a healthy rig
+# (docs/hardware-api-reference.md), so each probe tolerates one routine
+# hiccup's worth of stale time on top of the fractional budget; a gap beyond
+# the routine ceiling or a median gap above dataset_spec.md's 50 ms degraded-
+# stream bound fails regardless of probe length.
 HEALTH_MAX_AGE_S = 0.20
 HEALTH_MAX_STALE_FRACTION = 0.0005
-HEALTH_MAX_GAP_S = 0.300
+HEALTH_ROUTINE_HICCUP_MAX_S = 0.370
+HEALTH_MAX_GAP_S = 0.500
+HEALTH_MAX_MEDIAN_GAP_S = 0.050
 HEALTH_MIN_FPS = 20.0
 
 
@@ -218,17 +225,28 @@ def evaluate_stream_health(
     receipt_monotonic_ns: Sequence[int],
     duration_s: float,
     *,
+    probe_end_monotonic_ns: int | None = None,
     max_age_s: float = HEALTH_MAX_AGE_S,
     max_stale_fraction: float = HEALTH_MAX_STALE_FRACTION,
     max_gap_s: float = HEALTH_MAX_GAP_S,
+    max_median_gap_s: float = HEALTH_MAX_MEDIAN_GAP_S,
     min_fps: float = HEALTH_MIN_FPS,
     extra_problems: Sequence[str] = (),
 ) -> StreamHealthReport:
     """Judge measured frame receipt times against the episode-survival gate.
 
-    `stale_fraction` is the share of wall time during which the newest
+    Rates and stale time are measured over the span from the first receipt to
+    `probe_end_monotonic_ns` (when given): time before the first frame is
+    subscription discovery and does not count against the stream, but silence
+    after the last frame does — a stream that dies mid-probe must fail.
+
+    `stale_fraction` is the share of that span during which the newest
     available frame was already older than `max_age_s` — exactly the condition
-    that makes a 5 Hz recording tick discard the active episode.
+    that makes a 5 Hz recording tick discard the active episode. The stale
+    budget is `max_stale_fraction` of the span plus one routine hiccup
+    (HEALTH_ROUTINE_HICCUP_MAX_S), so a single documented-normal delivery
+    hiccup does not fail an otherwise healthy stream regardless of probe
+    length.
     """
     problems = list(extra_problems)
     receipts = np.asarray(receipt_monotonic_ns, dtype=np.int64)
@@ -246,11 +264,21 @@ def evaluate_stream_health(
             problems=tuple(problems),
         )
 
-    gaps_s = np.diff(receipts) / 1e9
-    total_s = float(receipts[-1] - receipts[0]) / 1e9
-    fps = receipts.size / duration_s if duration_s > 0 else 0.0
-    stale_fraction = float(np.clip(gaps_s - max_age_s, 0.0, None).sum() / total_s) if total_s > 0 else 1.0
+    end_ns = int(receipts[-1])
+    if probe_end_monotonic_ns is not None:
+        end_ns = max(end_ns, int(probe_end_monotonic_ns))
+    cadence_gaps_s = np.diff(receipts) / 1e9
+    gaps_s = cadence_gaps_s
+    tail_gap_s = (end_ns - int(receipts[-1])) / 1e9
+    if tail_gap_s > 0.0:
+        gaps_s = np.append(gaps_s, tail_gap_s)
+    total_s = float(end_ns - int(receipts[0])) / 1e9
+    fps = receipts.size / total_s if total_s > 0 else 0.0
+    stale_s = float(np.clip(gaps_s - max_age_s, 0.0, None).sum())
+    stale_fraction = stale_s / total_s if total_s > 0 else 1.0
+    stale_budget_s = max_stale_fraction * total_s + max(HEALTH_ROUTINE_HICCUP_MAX_S - max_age_s, 0.0)
     max_gap_s_measured = float(gaps_s.max())
+    median_gap_s = float(np.median(cadence_gaps_s))
 
     if fps < min_fps:
         problems.append(f"rate {fps:.1f} fps is below the {min_fps:.0f} fps minimum")
@@ -259,18 +287,24 @@ def evaluate_stream_health(
             f"largest delivery gap {max_gap_s_measured * 1000:.0f} ms exceeds"
             f" {max_gap_s * 1000:.0f} ms"
         )
-    if stale_fraction > max_stale_fraction:
+    if median_gap_s > max_median_gap_s:
         problems.append(
-            f"newest frame older than {max_age_s:.2f} s for {stale_fraction * 100:.3f}%"
-            f" of the time (limit {max_stale_fraction * 100:.3f}%); episodes would"
-            " frequently be discarded"
+            f"median delivery gap {median_gap_s * 1000:.1f} ms exceeds"
+            f" {max_median_gap_s * 1000:.0f} ms; the stream is degraded"
+        )
+    if stale_s > stale_budget_s:
+        problems.append(
+            f"newest frame older than {max_age_s:.2f} s for {stale_s:.2f} s of"
+            f" {total_s:.1f} s (budget {stale_budget_s:.2f} s ="
+            f" {max_stale_fraction * 100:.3f}% plus one routine hiccup);"
+            " episodes would frequently be discarded"
         )
 
     return StreamHealthReport(
         message_count=int(receipts.size),
         duration_s=float(duration_s),
         fps=float(fps),
-        median_gap_ms=float(np.median(gaps_s) * 1000),
+        median_gap_ms=median_gap_s * 1000,
         max_gap_ms=max_gap_s_measured * 1000,
         stale_fraction=stale_fraction,
         problems=tuple(problems),
@@ -332,11 +366,16 @@ def measure_stream_health(
         deadline = time.monotonic() + duration_s
         while time.monotonic() < deadline:
             executor.spin_once(timeout_sec=0.1)
+        probe_end_ns = time.monotonic_ns()
     finally:
         executor.shutdown()
         node.destroy_node()
         context.try_shutdown()
 
     return evaluate_stream_health(
-        receipts, duration_s, max_age_s=max_age_s, extra_problems=format_problems
+        receipts,
+        duration_s,
+        probe_end_monotonic_ns=probe_end_ns,
+        max_age_s=max_age_s,
+        extra_problems=format_problems,
     )

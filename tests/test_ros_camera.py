@@ -75,9 +75,22 @@ def test_stream_health_accepts_a_steady_stream():
     assert report.stale_fraction == 0.0
 
 
+def test_stream_health_tolerates_one_routine_hiccup_but_not_two():
+    # docs/hardware-api-reference.md: 100-370 ms hiccups are routine on a
+    # healthy rig, so a single one must not fail the gate.
+    one_hiccup = [1 / 60] * 300 + [0.350] + [1 / 60] * 300
+    report = evaluate_stream_health(_receipts_ns(one_hiccup), duration_s=10.35)
+    assert report.healthy
+
+    two_hiccups = [1 / 60] * 200 + [0.350] + [1 / 60] * 200 + [0.350] + [1 / 60] * 200
+    report = evaluate_stream_health(_receipts_ns(two_hiccups), duration_s=10.7)
+    assert not report.healthy
+    assert any("older than" in problem for problem in report.problems)
+
+
 def test_stream_health_rejects_large_gaps_and_stale_time():
-    gaps = [1 / 60] * 300 + [0.350] + [1 / 60] * 300
-    report = evaluate_stream_health(_receipts_ns(gaps), duration_s=10.35)
+    gaps = [1 / 60] * 300 + [0.600] + [1 / 60] * 300
+    report = evaluate_stream_health(_receipts_ns(gaps), duration_s=10.6)
     assert not report.healthy
     assert any("gap" in problem for problem in report.problems)
 
@@ -87,11 +100,42 @@ def test_stream_health_rejects_large_gaps_and_stale_time():
     assert any("older than" in problem for problem in report.problems)
 
 
+def test_stream_health_rejects_a_degraded_median_cadence():
+    # dataset_spec.md: a median gap above 50 ms indicates a degraded stream,
+    # even when the average rate still clears the fps minimum.
+    gaps = [0.060] * 151 + [0.010] * 150
+    report = evaluate_stream_health(_receipts_ns(gaps), duration_s=10.56)
+    assert not report.healthy
+    assert any("degraded" in problem for problem in report.problems)
+
+
+def test_stream_health_detects_a_stream_that_dies_mid_probe():
+    receipts = _receipts_ns([1 / 60] * 200)  # healthy 60 fps for ~3.3 s
+    report = evaluate_stream_health(
+        receipts, duration_s=5.0, probe_end_monotonic_ns=int(5.0e9)
+    )
+    assert not report.healthy
+    assert any("gap" in problem for problem in report.problems)
+
+
+def test_stream_health_ignores_subscription_discovery_latency():
+    # First frame lands 3.5 s into a 5 s probe (discovery latency), then a
+    # clean 60 fps stream: rates are judged from the first receipt onward.
+    receipts = [int((3.5 + i / 60) * 1e9) for i in range(91)]
+    report = evaluate_stream_health(
+        receipts, duration_s=5.0, probe_end_monotonic_ns=int(5.0e9)
+    )
+    assert report.healthy
+    assert report.fps == pytest.approx(60.7, abs=0.5)
+
+
 def test_stream_health_rejects_an_empty_or_missing_stream():
     report = evaluate_stream_health([], duration_s=10.0)
     assert not report.healthy
-    report = evaluate_stream_health(_receipts_ns([1 / 60] * 60), duration_s=10.0)
-    assert not report.healthy  # 61 msgs in 10 s -> 6.1 fps, below the minimum
+    report = evaluate_stream_health(
+        _receipts_ns([1 / 60] * 60), duration_s=10.0, probe_end_monotonic_ns=int(10.0e9)
+    )
+    assert not report.healthy  # 61 msgs, then silence for 9 s -> 6.1 fps
 
 
 def test_stream_health_carries_format_problems():

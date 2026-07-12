@@ -5,10 +5,12 @@ machine in its collection-time state — no browser or other heavy load):
 
     uv run scripts/check_camera_health.py [--duration 60]
 
-Exits 0 when the stream satisfies the episode-survival gate (newest frame
-older than the freshness bound for at most 0.05% of the time, no delivery gap
-over 300 ms), otherwise prints the problems and exits 1. The same gate runs
-automatically at collector startup; `--skip-camera-check` there bypasses it.
+Exits 0 when the stream satisfies the episode-survival gate: stale time within
+the 0.05% budget plus at most one routine hiccup (<= 370 ms), no delivery gap
+over 500 ms, median gap <= 50 ms, and >= 20 fps measured from the first frame
+to the end of the probe (so a stream that dies mid-probe fails). Otherwise it
+prints the problems and exits 1. The same gate runs automatically at collector
+startup; `--skip-camera-check` there bypasses it.
 """
 
 from __future__ import annotations

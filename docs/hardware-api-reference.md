@@ -166,7 +166,9 @@ Delivery hiccups of 100–370 ms occur even on a healthy rig, and desktop load
 (a browser, etc.) multiplies them ~80×. For a 150-tick episode to survive the
 freshness rule with p >= 0.9, the newest frame may be older than the bound for
 at most ~0.05% of wall time. `scripts/check_camera_health.py` measures exactly
-this and must report HEALTHY before a session; the collector runs the same gate
+this (tolerating one routine hiccup per probe, since a short probe cannot
+resolve the 0.05% rate and one documented-normal hiccup is not degradation)
+and must report HEALTHY before a session; the collector runs the same gate
 at startup (skip with `--skip-camera-check`). Collect on a quiet machine.
 Kernel tuning that helps and currently resets at reboot: `net.core.rmem_max`
 / `rmem_default` / `wmem_max` / `wmem_default` = 64 MB, and
