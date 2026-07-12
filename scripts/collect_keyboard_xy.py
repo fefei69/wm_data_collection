@@ -23,17 +23,22 @@ try:  # package import for tests; direct-file import for ``uv run scripts/...``
         build_episode_columns,
         validate_magnitudes,
     )
+    from scripts.ros_camera import HEALTH_MAX_AGE_S
 except ImportError:  # pragma: no cover - exercised by direct script execution
     from collector_core import ImageTransformProfile, build_episode_columns, validate_magnitudes
+    from ros_camera import HEALTH_MAX_AGE_S
 
 
 ACTION_CAP_M = 0.010
 TICK_S = 0.2
-# 0.20 (was 0.10): measured 2026-07-11 at 640x480x60 — typical frame age is
-# 17-35 ms, but delivery hiccups of 100-200 ms are routine, and one tick is
-# the hard ceiling anyway (each tick also requires a NEW frame). The logged
-# image_receipt/command timestamps let QA audit the true lag per row.
-IMAGE_MAX_AGE_S = 0.20
+# The freshness bound is owned by scripts/ros_camera.py so the health gate and
+# the recording tick can never disagree; IMAGE_MAX_AGE_S is the spec's name for
+# it (docs/hardware-api-reference.md). 0.20 (was 0.10): measured 2026-07-11 at
+# 640x480x60 — typical frame age is 17-35 ms, but delivery hiccups of
+# 100-200 ms are routine, and one tick is the hard ceiling anyway (each tick
+# also requires a NEW frame). The logged image_receipt/command timestamps let
+# QA audit the true lag per row.
+IMAGE_MAX_AGE_S = HEALTH_MAX_AGE_S
 RESET_STEP_M = 0.005
 RESET_TOLERANCE_M = 0.002  # placeholder pending commissioning; see HOLD_POSITION_TOLERANCE_M in the spec
 FIXED_ORIENTATION = np.array([0.0, math.pi / 2.0, 0.0], dtype=np.float64)
@@ -324,6 +329,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     next_recording_report_s = 5
     target_xy = np.array(config.start_xy, dtype=np.float64)
     previous_sequence: int | None = None
+    preview_sequence: int | None = None
     episode_id = 0
     recorder = EpisodeRecorder(output_h5=config.output_h5)
     preview = np.zeros((224, 224, 3), dtype=np.uint8)
@@ -446,6 +452,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         previous_sequence = snapshot.sequence
                         pixels = config.transform_profile.apply(snapshot.rgb)
                         preview = pixels
+                        preview_sequence = snapshot.sequence
                         pose = arm.pose()
                         row = {
                             "pixels": pixels,
@@ -473,8 +480,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     # Idle: keep the live preview current so the operator can
                     # frame the box/pusher before recording (workflow step 1).
                     snapshot = image_store.snapshot()
-                    if snapshot is not None:
+                    if snapshot is not None and snapshot.sequence != preview_sequence:
                         preview = config.transform_profile.apply(snapshot.rgb)
+                        preview_sequence = snapshot.sequence
                     if np.linalg.norm(actual) > 0.0:
                         resetting = False  # any arrow cancels an in-flight reset
                         arm.send_cartesian(np.r_[target, config.fixed_z, FIXED_ORIENTATION])
@@ -493,8 +501,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                             )
                             arm.send_cartesian(np.r_[reset_target, config.fixed_z, FIXED_ORIENTATION])
                             target_xy = reset_target
-                            if float(np.linalg.norm(start - target_xy)) <= RESET_TOLERANCE_M:
-                                resetting = False
                 if not recording and quit_requested:
                     break
             pygame_input.render(preview, "recording" if recording else "idle")

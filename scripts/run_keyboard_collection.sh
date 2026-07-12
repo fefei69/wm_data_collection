@@ -8,6 +8,7 @@ cd "$repo_root"
 timestamp="$(date +%Y%m%d_%H%M%S)"
 output="data/pushbox_keyboard_${timestamp}.h5"
 video_dir="output_videos/${timestamp}"
+check_seconds=5
 
 cat <<EOF
 
@@ -43,10 +44,13 @@ Safety:
 Dataset: $output
 Videos:  $video_dir/
 
-Starting with a 5-second camera health check...
+Starting with a ${check_seconds}-second camera health check...
 
 EOF
 
+# --disable-xy-limits: the X/Y bounds passed below are not yet commissioned on
+# this table; drop the flag to enable clamping once they are verified. Keep the
+# defaults in scripts/collect_keyboard_xy.py (CollectorConfig) in sync then.
 uv run scripts/collect_keyboard_xy.py \
   --transform-profile config/transform-profile.json \
   --camera-params config/camera-params.yaml \
@@ -55,7 +59,7 @@ uv run scripts/collect_keyboard_xy.py \
   --start-x 0.282 \
   --start-y 0.0185 \
   --trajectory-check-samples 10 \
-  --camera-check-seconds 5 \
+  --camera-check-seconds "$check_seconds" \
   --disable-xy-limits \
   --output "$output" \
   --video-dir "$video_dir" \

@@ -25,6 +25,13 @@ HEALTH_MAX_GAP_S = 0.500
 HEALTH_MAX_MEDIAN_GAP_S = 0.050
 HEALTH_MIN_FPS = 20.0
 
+# Contract with the external RealSense publisher (dataset_spec.md): rgb8,
+# 640x480 at 60 fps, subscribed best-effort/volatile keeping only the newest
+# frame. Every consumer must validate against these constants so the health
+# probe, the live subscriber, and the store can never drift apart.
+EXPECTED_WIDTH = 640
+EXPECTED_HEIGHT = 480
+
 
 @dataclass(frozen=True)
 class ImageSnapshot:
@@ -67,8 +74,10 @@ class LatestImageStore:
         receipt_monotonic_ns: int | None = None,
     ) -> int:
         image = np.asarray(rgb)
-        if image.shape != (480, 640, 3) or image.dtype != np.uint8:
-            raise ValueError("ROS image must be RGB uint8 with shape (480, 640, 3)")
+        if image.shape != (EXPECTED_HEIGHT, EXPECTED_WIDTH, 3) or image.dtype != np.uint8:
+            raise ValueError(
+                f"ROS image must be RGB uint8 with shape ({EXPECTED_HEIGHT}, {EXPECTED_WIDTH}, 3)"
+            )
         receipt = time.monotonic_ns() if receipt_monotonic_ns is None else int(receipt_monotonic_ns)
         with self._lock:
             self._sequence += 1
@@ -99,6 +108,36 @@ class LatestImageStore:
         return 0.0 <= age_s <= float(max_age_s)
 
 
+def _require_ros() -> tuple[Any, Any, Any]:
+    """Import the ROS 2 stack lazily so this module loads on dev machines."""
+    try:
+        import rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        from sensor_msgs.msg import Image
+    except ImportError as exc:
+        raise RuntimeError(
+            "ROS 2 Jazzy and sensor_msgs must be sourced on the robot host"
+        ) from exc
+    return rclpy, SingleThreadedExecutor, Image
+
+
+def _image_qos() -> Any:
+    """Subscription QoS matching the RealSense publisher: best-effort, newest frame only."""
+    from rclpy.qos import (
+        QoSDurabilityPolicy,
+        QoSHistoryPolicy,
+        QoSProfile,
+        QoSReliabilityPolicy,
+    )
+
+    return QoSProfile(
+        history=QoSHistoryPolicy.KEEP_LAST,
+        depth=1,
+        reliability=QoSReliabilityPolicy.BEST_EFFORT,
+        durability=QoSDurabilityPolicy.VOLATILE,
+    )
+
+
 class RosImageSubscriber:
     """Lazy ROS 2 Jazzy adapter; importable on hosts without ROS installed."""
 
@@ -118,21 +157,8 @@ class RosImageSubscriber:
         self._owns_rclpy = False
 
     def start(self) -> None:
-        try:
-            import rclpy
-            from rclpy.executors import SingleThreadedExecutor
-            from rclpy.node import Node
-            from rclpy.qos import (
-                QoSDurabilityPolicy,
-                QoSHistoryPolicy,
-                QoSProfile,
-                QoSReliabilityPolicy,
-            )
-            from sensor_msgs.msg import Image
-        except ImportError as exc:
-            raise RuntimeError(
-                "ROS 2 Jazzy and sensor_msgs must be sourced on the robot host"
-            ) from exc
+        rclpy, SingleThreadedExecutor, Image = _require_ros()
+        from rclpy.node import Node
 
         self._rclpy = rclpy
         if not rclpy.ok():
@@ -144,24 +170,19 @@ class RosImageSubscriber:
         class ImageNode(Node):
             def __init__(self) -> None:
                 super().__init__("pushbox_keyboard_image_subscriber")
-                qos = QoSProfile(
-                    history=QoSHistoryPolicy.KEEP_LAST,
-                    depth=1,
-                    reliability=QoSReliabilityPolicy.BEST_EFFORT,
-                    durability=QoSDurabilityPolicy.VOLATILE,
-                )
                 self.subscription = self.create_subscription(
                     Image,
                     self_topic,
                     self.callback,
-                    qos,
+                    _image_qos(),
                 )
 
             def callback(self, message: Any) -> None:
                 try:
-                    if message.width != 640 or message.height != 480:
+                    if message.width != EXPECTED_WIDTH or message.height != EXPECTED_HEIGHT:
                         raise ValueError(
-                            f"expected 640x480, received {message.width}x{message.height}"
+                            f"expected {EXPECTED_WIDTH}x{EXPECTED_HEIGHT},"
+                            f" received {message.width}x{message.height}"
                         )
                     rgb = decode_rgb8(message)
                     source_ns = int(message.header.stamp.sec) * 1_000_000_000
@@ -333,20 +354,7 @@ def measure_stream_health(
     Uses a private rclpy context so it can run before, and independently of,
     `RosImageSubscriber`. Also validates the first message's encoding/shape.
     """
-    try:
-        import rclpy
-        from rclpy.executors import SingleThreadedExecutor
-        from rclpy.qos import (
-            QoSDurabilityPolicy,
-            QoSHistoryPolicy,
-            QoSProfile,
-            QoSReliabilityPolicy,
-        )
-        from sensor_msgs.msg import Image
-    except ImportError as exc:
-        raise RuntimeError(
-            "ROS 2 Jazzy and sensor_msgs must be sourced on the robot host"
-        ) from exc
+    rclpy, SingleThreadedExecutor, Image = _require_ros()
 
     context = rclpy.Context()
     rclpy.init(args=None, context=context)
@@ -356,23 +364,20 @@ def measure_stream_health(
     def callback(message: Any) -> None:
         receipts.append(time.monotonic_ns())
         if len(receipts) == 1:
-            if message.encoding != "rgb8":
-                format_problems.append(f"encoding {message.encoding!r} is not rgb8")
-            if message.width != 640 or message.height != 480:
-                format_problems.append(
-                    f"resolution {message.width}x{message.height} is not 640x480"
-                )
+            try:
+                if message.width != EXPECTED_WIDTH or message.height != EXPECTED_HEIGHT:
+                    raise ValueError(
+                        f"resolution {message.width}x{message.height} is not"
+                        f" {EXPECTED_WIDTH}x{EXPECTED_HEIGHT}"
+                    )
+                decode_rgb8(message)
+            except ValueError as exc:
+                format_problems.append(str(exc))
 
     node = rclpy.create_node("pushbox_camera_health_probe", context=context)
     executor = SingleThreadedExecutor(context=context)
     try:
-        qos = QoSProfile(
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1,
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            durability=QoSDurabilityPolicy.VOLATILE,
-        )
-        node.create_subscription(Image, topic, callback, qos)
+        node.create_subscription(Image, topic, callback, _image_qos())
         executor.add_node(node)
         deadline = time.monotonic() + duration_s
         while time.monotonic() < deadline:

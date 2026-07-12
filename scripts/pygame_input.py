@@ -177,23 +177,3 @@ class PygameInputBackend:
         self._screen = None
         self._clock = None
         self._font = None
-
-    def confirm_shutdown(self) -> None:
-        """Require an explicit Enter press before a low-arm retreat."""
-        if self._pygame is None or self._screen is None or self._font is None:
-            return
-        pygame = self._pygame
-        self._screen.fill((20, 20, 20))
-        text = self._font.render(
-            "Clear the table, then press Enter to retreat",
-            True,
-            (255, 255, 255),
-        )
-        self._screen.blit(text, (12, self.size - 12))
-        pygame.display.flip()
-        while True:
-            for event in pygame.event.get():
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
-                    return
-            if self._clock is not None:
-                self._clock.tick(self.ui_fps)
