@@ -66,7 +66,13 @@ focus loss stops motion and discards an active episode.
 - Include pushes in both camera-near and camera-far directions.
 - Use simultaneous orthogonal arrows to collect all four normalized diagonal
   actions as well as the four cardinals.
-- Use all three speed levels during both contact and contact-free movement.
+- Use all three speed levels during both contact and contact-free movement, and
+  vary speed both within individual episodes and across the session.
+- Hold a selected speed for several 5 Hz ticks rather than changing it every
+  tick; cover each speed across workspace regions, approach directions, and
+  both contact and contact-free motion.
+- Before reversing a 10 mm command, release the arrows for a zero-action tick
+  or step down to speed 1 to avoid an abrupt full-speed reversal.
 - Vary push duration and direction; include reversals and releases.
 - Make approximately 10–20% of the motion deliberately contact-free.
 - Include approach, first contact, sustained contact, separation, and periods
@@ -92,6 +98,9 @@ focus loss stops motion and discards an active episode.
 - Don't chase a task-success score or repeat one preferred pushing strategy.
 - Don't let 5 mm cardinal actions dominate; deliberately cover every direction
   and magnitude.
+- Don't consistently use fast motion only near the base and slow motion only
+  while extended; cover speeds across configurations so speed is not confounded
+  with arm position.
 - Don't collect only contact motion; the model must also learn no-contact
   dynamics.
 - Don't let the box remain outside the useful view or reachable workspace.
