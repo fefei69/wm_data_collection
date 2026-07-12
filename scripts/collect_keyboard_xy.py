@@ -31,6 +31,12 @@ except ImportError:  # pragma: no cover - exercised by direct script execution
 
 ACTION_CAP_M = 0.010
 TICK_S = 0.2
+# A tick this late means the loop blocked (episode save, host stall) rather
+# than ordinary polling jitter (< 33 ms at the 30 fps UI clock). The schedule
+# then realigns instead of firing a 30 Hz catch-up burst, and an active episode
+# is discarded per the spec: never skip a tick and later resume with a timing
+# gap (docs/keyboard_xy_collection_spec.md §8).
+TICK_MAX_LATENESS_S = TICK_S / 2
 # The freshness bound is owned by scripts/ros_camera.py so the health gate and
 # the recording tick can never disagree; IMAGE_MAX_AGE_S is the spec's name for
 # it (docs/hardware-api-reference.md). 0.20 (was 0.10): measured 2026-07-11 at
@@ -405,7 +411,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             now = time.monotonic()
             if now >= next_tick:
+                lateness_s = now - next_tick
                 next_tick += TICK_S
+                if lateness_s > TICK_MAX_LATENESS_S:
+                    next_tick = now + TICK_S
+                    if recording:
+                        discard_episode("tick overran the 5 Hz schedule")
                 held_action = pygame_input.action()
                 if pending_stop and recording:
                     held_action = np.zeros(2, dtype=np.float32)
