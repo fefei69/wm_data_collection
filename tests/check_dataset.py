@@ -88,14 +88,31 @@ def check_schema(f: h5py.File) -> tuple[CheckResult, int]:
         result.fail(f"columns disagree on row count: {lengths}")
     total = next(iter(lengths.values()), 0)
 
+    bookkeeping_valid = True
     for name in ("ep_len", "ep_offset"):
         if name not in f:
             result.fail(f"missing writer bookkeeping dataset: {name}")
-            return result, total
+            bookkeeping_valid = False
+            continue
+        dataset = f[name]
+        if dataset.ndim != 1:
+            result.fail(f"{name}: bookkeeping dataset must be one-dimensional")
+            bookkeeping_valid = False
+        if not np.issubdtype(dataset.dtype, np.integer):
+            result.fail(f"{name}: dtype {dataset.dtype} is not an integer dtype")
+            bookkeeping_valid = False
+    if not bookkeeping_valid:
+        return result, total
+
     ep_len = np.asarray(f["ep_len"], dtype=np.int64)
     ep_offset = np.asarray(f["ep_offset"], dtype=np.int64)
     if ep_len.shape != ep_offset.shape:
         result.fail(f"ep_len {ep_len.shape} and ep_offset {ep_offset.shape} disagree")
+        return result, total
+    if np.any(ep_len <= 0):
+        result.fail("ep_len values must all be positive")
+    if np.any(ep_offset < 0):
+        result.fail("ep_offset values must all be nonnegative")
     if ep_len.size and int(ep_len.sum()) != total:
         result.fail(f"sum(ep_len)={int(ep_len.sum())} does not cover the {total} rows")
     expected_offsets = np.concatenate(([0], np.cumsum(ep_len)[:-1])) if ep_len.size else ep_offset
@@ -202,7 +219,16 @@ def check_episode(
     # Alignment (§8.1) — the spec threshold applies to contact-free segments,
     # which are not labeled, so pooled correlation only warns.
     correlation = alignment_correlation(proprio, action)
-    if not np.isnan(correlation) and correlation < MIN_ALIGNMENT_CORRELATION:
+    commanded_motion = bool(
+        np.any(np.linalg.norm(action[:-1], axis=1) > CAP_EPSILON_M)
+    )
+    if np.isnan(correlation):
+        if commanded_motion:
+            result.fail(
+                f"{prefix}: displacement/action correlation is undefined despite"
+                " nonzero commands"
+            )
+    elif correlation < MIN_ALIGNMENT_CORRELATION:
         hint = ""
         shifted = {s: alignment_correlation(proprio, action, shift=s) for s in (-1, 1)}
         best_shift = max(shifted, key=lambda s: np.nan_to_num(shifted[s], nan=-2.0))
