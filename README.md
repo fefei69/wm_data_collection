@@ -62,6 +62,20 @@ diagonals, with `1`/`2`/`3` selecting 2.5/5/10 mm action magnitudes.
 The short runbook for the person operating it is
 [docs/teleoperator_guidelines.md](docs/teleoperator_guidelines.md).
 
+To validate and summarize every HDF5 dataset below `data/` and fully decode
+its matching preview videos below `output_videos/`, run:
+
+```bash
+bash scripts/check_dataset.sh
+```
+
+The report prints per-file, per-episode, and combined timing, image latency,
+action coverage, arm tracking, pixel continuity, brightness, and video/HDF5
+frame-count statistics. Its final summary shows the collected time, percentage
+of the four-hour goal, and remaining time. Pass `--goal-hours N` to change that
+goal, explicit HDF5 paths for a targeted report, or `--strict` when warnings
+should produce a failing exit status.
+
 The collector requires a commissioned image-transform JSON and camera-parameter
 dump, plus robot-specific pose/bound values:
 
