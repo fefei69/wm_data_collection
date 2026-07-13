@@ -4,9 +4,11 @@ import pytest
 from scripts.collect_keyboard_xy import (
     CollectorConfig,
     EpisodeRecorder,
+    FixedZMonitor,
     accepted_target,
     advance_tick_deadline,
     command_interval_is_valid,
+    move_arm_home_then_zero,
 )
 
 
@@ -14,6 +16,59 @@ def test_default_config_validates_with_limits_enforced():
     # Guards against the defaults drifting apart again (start_xy used to sit
     # outside x_bounds, making every default-constructed config self-reject).
     CollectorConfig().validate()
+
+
+def test_config_rejects_nonpositive_fixed_z_warning_tolerance():
+    with pytest.raises(ValueError, match="fixed_z_warning_tolerance"):
+        CollectorConfig(fixed_z_warning_tolerance=0.0).validate()
+
+
+def test_fixed_z_monitor_reports_deviation_and_recovery_transitions():
+    monitor = FixedZMonitor(target_z=0.03, tolerance_m=0.002)
+
+    assert monitor.update(0.031) is None
+    warning = monitor.update(0.033)
+    assert warning is not None
+    assert "WARNING" in warning
+    assert "error=+3.0 mm" in warning
+    assert monitor.update(0.034) is None
+
+    recovery = monitor.update(0.0315)
+    assert recovery is not None
+    assert "recovered" in recovery
+    assert monitor.update(0.03) is None
+
+
+def test_fixed_z_monitor_warns_for_nonfinite_measurement():
+    monitor = FixedZMonitor(target_z=0.03)
+
+    warning = monitor.update(float("nan"))
+
+    assert warning is not None
+    assert "WARNING" in warning
+    assert "not finite" in warning
+
+
+def test_shutdown_moves_home_then_zero_with_blocking_adapter_calls(capsys):
+    class FakeArm:
+        def __init__(self):
+            self.calls = []
+
+        def home(self, positions, goal_time=2.0):
+            self.calls.append((np.asarray(positions).copy(), goal_time))
+
+    arm = FakeArm()
+    home = np.array([0.0, np.pi / 2, np.pi / 2, 0.0, 0.0, 0.0, 0.0])
+
+    move_arm_home_then_zero(arm, home)
+
+    assert len(arm.calls) == 2
+    np.testing.assert_allclose(arm.calls[0][0], home)
+    np.testing.assert_allclose(arm.calls[1][0], np.zeros(7))
+    assert arm.calls[0][1] == 2.0
+    assert arm.calls[1][1] == 2.0
+    output = capsys.readouterr().out
+    assert output.index("home position") < output.index("zero position")
 
 
 def test_config_rejects_missing_commissioning_files(tmp_path):

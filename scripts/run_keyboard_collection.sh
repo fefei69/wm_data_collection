@@ -38,7 +38,7 @@ Timing:
 Safety:
   X/Y workspace limits are disabled for this launcher.
   Losing window focus stops motion and discards an active episode.
-  On shutdown, the arm stays at its current pose; it does not retreat or sleep.
+  On q/window-close while idle, the arm moves home, then to all-zero joints.
   Keep an emergency-stop hand ready; post-move tracking is not yet verified.
 
 Dataset: $output
@@ -56,7 +56,7 @@ uv run scripts/collect_keyboard_xy.py \
   --camera-params config/camera-params.yaml \
   --fixed-z 0.03 \
   --safe-z 0.15 \
-  --start-x 0.282 \
+  --start-x 0.14 \
   --start-y 0.0185 \
   --trajectory-check-samples 10 \
   --camera-check-seconds "$check_seconds" \
@@ -64,3 +64,4 @@ uv run scripts/collect_keyboard_xy.py \
   --output "$output" \
   --video-dir "$video_dir" \
   "$@"
+  # --skip-camera-check \

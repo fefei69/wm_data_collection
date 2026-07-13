@@ -46,6 +46,7 @@ UI_SLEEP_MAX_S = 0.005
 IMAGE_MAX_AGE_S = HEALTH_MAX_AGE_S
 RESET_STEP_M = 0.005
 RESET_TOLERANCE_M = 0.002  # placeholder pending commissioning; see HOLD_POSITION_TOLERANCE_M in the spec
+DEFAULT_FIXED_Z_WARNING_TOLERANCE_M = 0.002
 FIXED_ORIENTATION = np.array([0.0, math.pi / 2.0, 0.0], dtype=np.float64)
 DEFAULT_MAGNITUDES = {1: 0.0025, 2: 0.005, 3: 0.010}
 
@@ -66,6 +67,40 @@ def command_interval_is_valid(previous_ns: int | None, current_ns: int) -> bool:
     target_ns = round(TICK_S * 1e9)
     tolerance_ns = round(TICK_TOLERANCE_S * 1e9)
     return abs(interval_ns - target_ns) <= tolerance_ns
+
+
+@dataclass
+class FixedZMonitor:
+    """Report transitions into and out of a fixed-Z tracking deviation."""
+
+    target_z: float
+    tolerance_m: float = DEFAULT_FIXED_Z_WARNING_TOLERANCE_M
+    deviating: bool = field(init=False, default=False)
+
+    def update(self, measured_z: float) -> str | None:
+        measured = float(measured_z)
+        error_m = measured - self.target_z
+        outside_tolerance = not math.isfinite(measured) or abs(error_m) > self.tolerance_m
+        if outside_tolerance == self.deviating:
+            return None
+        self.deviating = outside_tolerance
+        if outside_tolerance:
+            if not math.isfinite(measured):
+                return (
+                    "WARNING: fixed Z tracking measurement is not finite: "
+                    f"target={self.target_z:.4f} m, measured={measured}"
+                )
+            return (
+                "WARNING: fixed Z tracking deviation: "
+                f"target={self.target_z:.4f} m, measured={measured:.4f} m, "
+                f"error={error_m * 1000:+.1f} mm "
+                f"(tolerance={self.tolerance_m * 1000:.1f} mm)"
+            )
+        return (
+            "fixed Z tracking recovered: "
+            f"target={self.target_z:.4f} m, measured={measured:.4f} m, "
+            f"error={error_m * 1000:+.1f} mm"
+        )
 
 
 def accepted_target(
@@ -101,6 +136,7 @@ class CollectorConfig:
     follower_ip: str = "192.168.1.3"
     fixed_z: float = 0.20
     safe_z: float = 0.30
+    fixed_z_warning_tolerance: float = DEFAULT_FIXED_Z_WARNING_TOLERANCE_M
     # Commissioned start pose (matches run_keyboard_collection.sh); must lie
     # inside the default bounds so a default config validates.
     start_xy: tuple[float, float] = (0.282, 0.0185)
@@ -143,11 +179,20 @@ class CollectorConfig:
     def validate(self) -> None:
         if not self.follower_ip:
             raise ValueError("follower_ip must not be empty")
-        values = [self.fixed_z, self.safe_z, *self.start_xy, *self.x_bounds, *self.y_bounds]
+        values = [
+            self.fixed_z,
+            self.safe_z,
+            self.fixed_z_warning_tolerance,
+            *self.start_xy,
+            *self.x_bounds,
+            *self.y_bounds,
+        ]
         if not all(np.isfinite(value) for value in values):
             raise ValueError("pose and workspace values must be finite")
         if self.safe_z <= self.fixed_z:
             raise ValueError("safe_z must be above fixed_z")
+        if self.fixed_z_warning_tolerance <= 0.0:
+            raise ValueError("fixed_z_warning_tolerance must be positive")
         if self.x_bounds[0] >= self.x_bounds[1] or self.y_bounds[0] >= self.y_bounds[1]:
             raise ValueError("workspace bounds must be strictly increasing")
         if self.enforce_xy_limits:
@@ -266,6 +311,21 @@ class FollowerArmAdapter:
         )
 
 
+def move_arm_home_then_zero(
+    arm: FollowerArmAdapter,
+    home_positions: np.ndarray,
+    *,
+    goal_time: float = 2.0,
+) -> None:
+    """Complete the blocking home-to-zero sequence before driver teardown."""
+    home = np.asarray(home_positions, dtype=np.float64).reshape(-1)
+    print("Moving arm to home position...")
+    arm.home(home, goal_time=goal_time)
+    print("Moving arm to zero position...")
+    arm.home(np.zeros_like(home), goal_time=goal_time)
+    print("Arm reached zero position; exiting.")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=CollectorConfig.output_h5)
@@ -274,6 +334,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-params", required=True, type=Path)
     parser.add_argument("--follower-ip", default=CollectorConfig.follower_ip)
     parser.add_argument("--fixed-z", required=True, type=float)
+    parser.add_argument(
+        "--fixed-z-warning-tolerance",
+        type=float,
+        default=CollectorConfig.fixed_z_warning_tolerance,
+        help="warn when measured Z differs from --fixed-z by more than this many meters",
+    )
     parser.add_argument("--safe-z", required=True, type=float)
     parser.add_argument("--start-x", required=True, type=float)
     parser.add_argument("--start-y", required=True, type=float)
@@ -295,7 +361,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--camera-check-seconds",
         type=float,
-        default=15.0,
+        default=5.0,
         help="duration of the startup camera stream health gate",
     )
     return parser
@@ -309,6 +375,7 @@ def _config_from_args(args: argparse.Namespace) -> CollectorConfig:
         output_video_dir=args.video_dir,
         follower_ip=args.follower_ip,
         fixed_z=args.fixed_z,
+        fixed_z_warning_tolerance=args.fixed_z_warning_tolerance,
         safe_z=args.safe_z,
         start_xy=(args.start_x, args.start_y),
         x_bounds=(args.x_min, args.x_max),
@@ -359,6 +426,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     preview = np.zeros((224, 224, 3), dtype=np.uint8)
     blocked_action: tuple[float, float] | None = None
     xy_bounds = (config.x_bounds, config.y_bounds) if config.enforce_xy_limits else None
+    fixed_z_monitor = FixedZMonitor(config.fixed_z, config.fixed_z_warning_tolerance)
+
+    def report_fixed_z(pose: np.ndarray) -> None:
+        message = fixed_z_monitor.update(pose[2])
+        if message is not None:
+            print(message)
 
     def discard_episode(reason: str | None = None) -> None:
         """Single teardown path for every way an episode can be abandoned."""
@@ -386,6 +459,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         safe_pose = np.r_[target_xy, config.safe_z, FIXED_ORIENTATION]
         arm.send_cartesian(safe_pose, goal_time=2.0, blocking=True)
         arm.send_cartesian(np.r_[target_xy, config.fixed_z, FIXED_ORIENTATION], goal_time=2.0, blocking=True)
+        report_fixed_z(arm.pose())
         ros.start()
         pygame_input.start()
         next_tick = time.monotonic()
@@ -398,6 +472,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else:
                     resetting = False
                     quit_requested = True
+            if quit_requested:
+                # Do not issue another Cartesian tick after the operator asks
+                # to quit. The blocking joint-space shutdown starts below.
+                break
             if events.discard_requested:
                 discard_episode()
             if events.save_toggle:
@@ -461,6 +539,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         # A wrong-encoding/shape frame invalidates the active
                         # episode (docs/hardware-api-reference.md).
                         discard_episode("camera subscriber error")
+                pose = arm.pose()
+                report_fixed_z(pose)
                 if recording:
                     if recording_started_at is not None:
                         elapsed = time.monotonic() - recording_started_at
@@ -484,7 +564,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                         pixels = config.transform_profile.apply(snapshot.rgb)
                         preview = pixels
                         preview_sequence = snapshot.sequence
-                        pose = arm.pose()
                         proprio = np.r_[pose[:2], arm.velocities()[:2]].astype(np.float32)
                         command_ns = time.monotonic_ns()
                         if not command_interval_is_valid(previous_command_ns, command_ns):
@@ -540,8 +619,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                             )
                             arm.send_cartesian(np.r_[reset_target, config.fixed_z, FIXED_ORIENTATION])
                             target_xy = reset_target
-                if not recording and quit_requested:
-                    break
             now = time.monotonic()
             if now >= next_render:
                 pygame_input.render(preview, "recording" if recording else "idle")
@@ -549,13 +626,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             sleep_s = min(next_tick, next_render) - time.monotonic()
             if sleep_s > 0.0:
                 time.sleep(min(sleep_s, UI_SLEEP_MAX_S))
+        # The Trossen driver destructor switches the arm to idle. Keep the
+        # driver alive until both blocking moves have completed so it cannot
+        # idle the arm midway through the requested shutdown trajectory.
+        move_arm_home_then_zero(arm, home_positions)
     finally:
         if recording:
             # Best-effort discard: clearing the buffer must never mask a
             # real error propagating out of the try block above.
             recorder.start()
-        # Leave the arm holding its current pose. A normal q/window-close does
-        # not retreat, home, or sleep, so the operator controls any later move.
+        # Driver errors reach this block without running the automatic
+        # trajectory above; resource cleanup must not initiate recovery motion.
         pygame_input.close()
         ros.stop()
     return 0

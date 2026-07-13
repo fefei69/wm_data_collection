@@ -490,9 +490,11 @@ offline before live execution.
 - Verify each arrow's physical direction one key at a time.
 - Verify the pusher-tip height separately before enabling contact.
 - Use position mode only. Do not add external-effort/gravity mode to this MVP.
-- On `q` while idle, stop motion, close video/HDF5/ROS resources, and leave the
-  arm holding its current pose. Ignore `q` during an active episode so saving
-  always requires an explicit `SPACE` press.
+- On `q` or window-close while idle, stop Cartesian ticks, then use blocking
+  two-second joint commands to move the follower to the normal home pose and
+  then to the all-zero joint pose before allowing driver destruction to switch
+  it to idle. Ignore `q` during an active episode so saving always requires an
+  explicit `SPACE` press.
 - On a driver error or unexpected exception, stop issuing commands, close
   recording and Pygame resources, and leave the arm holding its last position;
   do not launch an automatic recovery trajectory.
@@ -511,6 +513,8 @@ Hardware-free tests must verify:
 - focus loss commands a zero hold, discards an active episode, disables motion,
   and requires all arrows released after focus returns;
 - lifecycle keys are edge-triggered and respect the specified priority;
+- clean idle shutdown moves to joint home and then all-zero joints, in order,
+  before the driver exits;
 - repeated commands change only base X/Y;
 - base Z and all three orientation values remain invariant;
 - `r` is ignored while recording and returns to start X/Y while idle without
