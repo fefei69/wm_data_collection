@@ -76,6 +76,20 @@ of the four-hour goal, and remaining time. Pass `--goal-hours N` to change that
 goal, explicit HDF5 paths for a targeted report, or `--strict` when warnings
 should produce a failing exit status.
 
+To merge every dataset below `data/` into one training file per collection
+date, first inspect the plan and then run the merge:
+
+```bash
+bash scripts/merge_datasets.sh --dry-run
+bash scripts/merge_datasets.sh
+```
+
+For example, all files containing `20260713` in their name are merged into
+`merged_data/pushbox_keyboard_20260713.h5`. The merger validates compatible
+schemas, reindexes episodes, rebuilds episode bookkeeping, records source-file
+provenance, and never modifies the source files. Existing merged files are not
+replaced unless `--overwrite` is passed.
+
 The collector requires a commissioned image-transform JSON and camera-parameter
 dump, plus robot-specific pose/bound values:
 
