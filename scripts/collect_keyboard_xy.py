@@ -140,8 +140,8 @@ class CollectorConfig:
     # Commissioned start pose (matches run_keyboard_collection.sh); must lie
     # inside the default bounds so a default config validates.
     start_xy: tuple[float, float] = (0.282, 0.0185)
-    x_bounds: tuple[float, float] = (0.18, 0.29)
-    y_bounds: tuple[float, float] = (-0.12, 0.12)
+    x_bounds: tuple[float, float] = (0.0183, 0.45)
+    y_bounds: tuple[float, float] = (-0.26, 0.26)
     trajectory_check_samples: int = 10
     enforce_xy_limits: bool = True
     magnitudes: Mapping[int, float] = field(default_factory=lambda: dict(DEFAULT_MAGNITUDES))
